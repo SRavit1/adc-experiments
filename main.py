@@ -14,12 +14,25 @@ import argparse
 from models import *
 from utils import progress_bar
 
+import logger
+import adc_utils
 
-parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
+# 32-bit precision not enough, as DQ(Q(X)) is not X
+#torch.set_default_dtype(torch.float64)
+
+parser = argparse.ArgumentParser(description='Process some integers.')
+parser.add_argument('--batch_size', default=32, help='Batch size.')
+parser.add_argument('--pretrain_epochs', default=50, help='number of epochs')
+parser.add_argument('--train_epochs', default=10, help='number of epochs')
+parser.add_argument('--log_dir', default="./log.txt", help='path to save log in')
+parser.add_argument('--float', action='store_true', help='test floating point model')
+parser.add_argument('--best_range_start', default=23, type=int, help='upper bit of best 8-bit range')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--resume', '-r', action='store_true',
                     help='resume from checkpoint')
 args = parser.parse_args()
+
+logger = logger.Logger(args.log_dir)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
@@ -54,7 +67,7 @@ classes = ('plane', 'car', 'bird', 'cat', 'deer',
 
 # Model
 print('==> Building model..')
-# net = VGG('VGG19')
+net = VGG('VGG19')
 # net = ResNet18()
 # net = PreActResNet18()
 # net = GoogLeNet()
@@ -68,26 +81,42 @@ print('==> Building model..')
 # net = ShuffleNetV2(1)
 # net = EfficientNetB0()
 # net = RegNetX_200MF()
-net = SimpleDLA()
+# net = SimpleDLA()
 net = net.to(device)
 if device == 'cuda':
     net = torch.nn.DataParallel(net)
     cudnn.benchmark = True
 
-if args.resume:
-    # Load checkpoint.
-    print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint = torch.load('./checkpoint/ckpt.pth')
-    net.load_state_dict(checkpoint['net'])
-    best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
+#PRETRAIN_PATH = "./resnet18_pretrained.pth"
+PRETRAIN_PATH = "./vgg_pretrained.pth"
+if os.path.exists(PRETRAIN_PATH):
+    checkpoint = torch.load(PRETRAIN_PATH)
+    if 'net' in checkpoint:
+        checkpoint = checkpoint['net']
+    net.load_state_dict(checkpoint)
+
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr,
                       momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
+def observe_data():
+    # since we're not training, we don't need to calculate the gradients for our outputs
+    with torch.no_grad():
+        for i, data in enumerate(testloader):
+            images, labels = data
+            images, labels = images.to(device), labels.to(device)
+            # calculate outputs by running images through the network
+            outputs = net(images)
+    return
+
+def change_mode(mode):
+    for m in net.modules():
+        if hasattr(m, "mode"):
+            m.mode = mode
+    #if mode == "quantize":
+    #    net.prepare_for_quantized_training()
 
 # Training
 def train(epoch):
@@ -136,19 +165,55 @@ def test(epoch):
     # Save checkpoint.
     acc = 100.*correct/total
     if acc > best_acc:
-        print('Saving..')
-        state = {
-            'net': net.state_dict(),
-            'acc': acc,
-            'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/ckpt.pth')
-        best_acc = acc
+        PRETRAIN_PATH = "./resnet18_pretrained.pth"
+        torch.save(net.state_dict(), PRETRAIN_PATH)
 
+def run_training():
+    for epoch in range(start_epoch, start_epoch+200):
+        train(epoch)
+        test(epoch)
+        scheduler.step()
 
-for epoch in range(start_epoch, start_epoch+200):
-    train(epoch)
-    test(epoch)
-    scheduler.step()
+for m in net.modules():
+    if hasattr(m, 'best_range_start'):
+        m.best_range_start = args.best_range_start
+
+if adc_utils.positive_weights:
+    counter = 0
+    for m in net.modules():
+        if isinstance(m, torch.nn.modules.Conv2d):
+            # from matplotlib import pyplot as plt
+            # plt.hist(m.weight.data.cpu().flatten().numpy(), label="before")
+            
+            m.weight.data = m.weight.data + 2*torch.sqrt(torch.var(m.weight.data))
+            m.weight.data = torch.nn.functional.relu(m.weight.data)
+
+            # plt.hist(m.weight.data.cpu().flatten().numpy(), label="after")
+            # plt.legend()
+            # plt.savefig("./hists/fig_" + str(counter) + ".png")
+            # plt.clf()
+            # counter += 1
+
+change_mode("float")
+PRETRAIN_PATH = "./resnet18_pretrained.pth"
+#PRETRAIN_PATH = "./resnet18_cifar_sgd_positive_weights.pth" if adc_utils.positive_weights else "./resnet18_cifar_sgd.pth"
+if not os.path.exists(PRETRAIN_PATH):
+    #logger.log("PRETRAINING FLOATING POINT NETWORK")
+    pretrain_accuracy = run_training(args.pretrain_epochs, trainloader, testloader, PRETRAIN_PATH)
+else:
+    #logger.log("LOADING PRETRAINED FLOATING POINT NETWORK")
+    net.load_state_dict(torch.load(PRETRAIN_PATH), strict=False)
+    #pretrain_accuracy = run_training(args.pretrain_epochs, trainloader, testloader, PRETRAIN_PATH)
+
+#logger.log("TESTING QUANTIZED NETWORK")
+if args.float:
+    change_mode("float")
+else:
+    #logger.log("OBSERVING DATA")
+    change_mode("observe")
+    observe_data()
+    change_mode("quantize")
+#train_accuracy = run_training()
+test_accuracy = test(0)
+#logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
+logger.log(str(args.best_range_start) + ", " + str(test_accuracy))
