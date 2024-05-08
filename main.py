@@ -4,16 +4,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-
 import torchvision
 import torchvision.transforms as transforms
-
 import os
 import argparse
-
 from models import *
 from utils import progress_bar
-
 import logger
 import adc_utils
 
@@ -23,13 +19,14 @@ import adc_utils
 parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('--batch_size', default=32, help='Batch size.')
 parser.add_argument('--pretrain_epochs', default=50, help='number of epochs')
-parser.add_argument('--train_epochs', default=10, help='number of epochs')
+parser.add_argument('--train_epochs', default=30, help='number of epochs')
 parser.add_argument('--log_dir', default="./log.txt", help='path to save log in')
 parser.add_argument('--float', action='store_true', help='test floating point model')
-parser.add_argument('--best_range_start', default=23, type=int, help='upper bit of best 8-bit range')
+parser.add_argument('--best_range_start', default=12, type=int, help='upper bit of best 8-bit range')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true',
-                    help='resume from checkpoint')
+parser.add_argument('--range_delta', default=2, type=int, help='best range delta for quantization')
+parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
+parser.add_argument('--per_layer_granularity', action='store_true', help='whether to apply per-tensor granularity')
 args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
@@ -67,8 +64,8 @@ classes = ('plane', 'car', 'bird', 'cat', 'deer',
 
 # Model
 print('==> Building model..')
-net = VGG('VGG19')
-# net = ResNet18()
+# net = VGG('VGG19')
+net = ResNet18()
 # net = PreActResNet18()
 # net = GoogLeNet()
 # net = DenseNet121()
@@ -83,17 +80,21 @@ net = VGG('VGG19')
 # net = RegNetX_200MF()
 # net = SimpleDLA()
 net = net.to(device)
+"""
 if device == 'cuda':
     net = torch.nn.DataParallel(net)
     cudnn.benchmark = True
+"""
 
-#PRETRAIN_PATH = "./resnet18_pretrained.pth"
-PRETRAIN_PATH = "./vgg_pretrained.pth"
+PRETRAIN_PATH = "./resnet18_pretrained.pth"
+#PRETRAIN_PATH = "./vgg_pretrained.pth"
+TRAIN_PATH = "./resnet18_pretrained.pth"
+#TRAIN_PATH = "./vgg_pretrained.pth"
 if os.path.exists(PRETRAIN_PATH):
     checkpoint = torch.load(PRETRAIN_PATH)
     if 'net' in checkpoint:
         checkpoint = checkpoint['net']
-    net.load_state_dict(checkpoint)
+    net.load_state_dict(checkpoint, strict=False)
 
 
 criterion = nn.CrossEntropyLoss()
@@ -111,12 +112,17 @@ def observe_data():
             outputs = net(images)
     return
 
+def get_mode():
+    for m in net.modules():
+        if hasattr(m, "mode"):
+            return m.mode
+
 def change_mode(mode):
     for m in net.modules():
         if hasattr(m, "mode"):
             m.mode = mode
-    #if mode == "quantize":
-    #    net.prepare_for_quantized_training()
+    if mode == "quantize":
+        net.prepare_for_quantized_training()
 
 # Training
 def train(epoch):
@@ -142,7 +148,9 @@ def train(epoch):
                      % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
 
-def test(epoch):
+def test(epoch, mode="train"):
+    SAVE_PATH = PRETRAIN_PATH if mode=="pretrain" else TRAIN_PATH
+
     global best_acc
     net.eval()
     test_loss = 0
@@ -165,18 +173,14 @@ def test(epoch):
     # Save checkpoint.
     acc = 100.*correct/total
     if acc > best_acc:
-        PRETRAIN_PATH = "./resnet18_pretrained.pth"
-        torch.save(net.state_dict(), PRETRAIN_PATH)
+        torch.save(net.state_dict(), SAVE_PATH)
+    return acc
 
-def run_training():
-    for epoch in range(start_epoch, start_epoch+200):
+def run_training(mode="train"):
+    for epoch in range(0, args.train_epochs):
         train(epoch)
-        test(epoch)
+        test(epoch, mode=mode)
         scheduler.step()
-
-for m in net.modules():
-    if hasattr(m, 'best_range_start'):
-        m.best_range_start = args.best_range_start
 
 if adc_utils.positive_weights:
     counter = 0
@@ -195,25 +199,73 @@ if adc_utils.positive_weights:
             # counter += 1
 
 change_mode("float")
-PRETRAIN_PATH = "./resnet18_pretrained.pth"
+PRETRAIN_PATH = "./vgg_pretrained_quant.pth"
+#PRETRAIN_PATH = "./resnet18_pretrained.pth"
 #PRETRAIN_PATH = "./resnet18_cifar_sgd_positive_weights.pth" if adc_utils.positive_weights else "./resnet18_cifar_sgd.pth"
 if not os.path.exists(PRETRAIN_PATH):
-    #logger.log("PRETRAINING FLOATING POINT NETWORK")
-    pretrain_accuracy = run_training(args.pretrain_epochs, trainloader, testloader, PRETRAIN_PATH)
+    logger.log("PRETRAINING FLOATING POINT NETWORK")
+    pretrain_accuracy = run_training(mode="pretrain")
 else:
-    #logger.log("LOADING PRETRAINED FLOATING POINT NETWORK")
+    logger.log("LOADING PRETRAINED FLOATING POINT NETWORK")
     net.load_state_dict(torch.load(PRETRAIN_PATH), strict=False)
-    #pretrain_accuracy = run_training(args.pretrain_epochs, trainloader, testloader, PRETRAIN_PATH)
+    #pretrain_accuracy = run_training(mode="pretrain")
+    #pretrain_accuracy = run_training(args.pretrain_epochs, trainloader, testloader, PRETRAIN_PATH, mode="pretrain")
 
-#logger.log("TESTING QUANTIZED NETWORK")
 if args.float:
     change_mode("float")
-else:
-    #logger.log("OBSERVING DATA")
-    change_mode("observe")
-    observe_data()
-    change_mode("quantize")
-#train_accuracy = run_training()
+    test_accuracy = test(0)
+    logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
+    exit(0)
+
+logger.log("OBSERVING DATA")
+change_mode("observe")
+observe_data()
+
+logger.log("ASSIGNING BEST RANGE")
+for m in net.modules():
+    if args.per_layer_granularity:
+        if hasattr(m, 'best_range_start'):
+            best_range_start = args.best_range_start
+            best_metric_val = float('inf') # lower difference is better
+            min_best_range_start = max(best_range_start-args.range_delta, 0)
+            max_best_range_start = min(best_range_start+args.range_delta, 23)
+            num_trials = 3
+            weight_orig = m.weight
+            
+            shape = (num_trials, m.weight.shape[1], 5, 5)
+            dummy_inputs = torch.normal(torch.ones(shape)*0., torch.ones(shape)*0.1).cuda()
+            for best_range_start_i in range(min_best_range_start, max_best_range_start+1):
+                # Approach 1: Using dummy inputs
+                """
+                total_difference = 0.
+                for trial_i in range(num_trials):
+                    dummy_input = dummy_inputs[trial_i:trial_i+1]
+                    with torch.no_grad():
+                        change_mode("quantize")
+                        m.best_range_start = best_range_start_i
+                        output_fq = m.forward(dummy_input.clone())
+                        change_mode("float")
+                        output_orig = m.forward(dummy_input.clone())
+                    difference = torch.norm(output_fq-output_orig)
+                    total_difference += float(difference)
+                avg_difference = total_difference / num_trials
+                curr_metric_val = float(avg_difference)
+                """
+
+                # Approach 2: Using test dataset
+                
+
+                if curr_metric_val < best_metric_val:
+                    best_range_start = best_range_start_i
+                    best_metric_val = curr_metric_val
+            m.best_range_start = best_range_start
+    else:
+        m.best_range_start = args.best_range_start
+
+logger.log("TESTING QUANTIZED NETWORK")
+#train_accuracy = run_training(mode="train")
+change_mode("quantize")
 test_accuracy = test(0)
-#logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
+
+logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
 logger.log(str(args.best_range_start) + ", " + str(test_accuracy))
