@@ -12,6 +12,7 @@ from models import *
 from utils import progress_bar
 import logger
 import adc_utils
+import ast
 
 # 32-bit precision not enough, as DQ(Q(X)) is not X
 #torch.set_default_dtype(torch.float64)
@@ -24,7 +25,7 @@ parser.add_argument('--log_dir', default="./log.txt", help='path to save log in'
 parser.add_argument('--float', action='store_true', help='test floating point model')
 parser.add_argument('--best_range_start', default=12, type=int, help='upper bit of best 8-bit range')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--range_delta', default=2, type=int, help='best range delta for quantization')
+parser.add_argument('--range_delta', default=4, type=int, help='best range delta for quantization')
 parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
 parser.add_argument('--per_layer_granularity', action='store_true', help='whether to apply per-tensor granularity')
 args = parser.parse_args()
@@ -62,23 +63,28 @@ testloader = torch.utils.data.DataLoader(
 classes = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
 
+net_name = 'VGG'
+net_dict = {
+    'VGG': VGG,
+    'ResNet18': ResNet18,
+    'PreActResNet18': PreActResNet18,
+    'GoogLeNet': GoogLeNet,
+    'DenseNet121': DenseNet121,
+    'ResNeXt29_2x64d': ResNeXt29_2x64d,
+    'MobileNet': MobileNet,
+    'MobileNetV2': MobileNetV2,
+    'DPN92': DPN92,
+    'ShuffleNetG2': ShuffleNetG2,
+    'SENet18': SENet18,
+    'ShuffleNetV2': ShuffleNetV2,
+    'EfficientNetB0': EfficientNetB0,
+    'RegNetX_200MF': RegNetX_200MF,
+    'SimpleDLA': SimpleDLA
+}
+
 # Model
 print('==> Building model..')
-# net = VGG('VGG19')
-net = ResNet18()
-# net = PreActResNet18()
-# net = GoogLeNet()
-# net = DenseNet121()
-# net = ResNeXt29_2x64d()
-# net = MobileNet()
-# net = MobileNetV2()
-# net = DPN92()
-# net = ShuffleNetG2()
-# net = SENet18()
-# net = ShuffleNetV2(1)
-# net = EfficientNetB0()
-# net = RegNetX_200MF()
-# net = SimpleDLA()
+net = net_dict[net_name]()
 net = net.to(device)
 """
 if device == 'cuda':
@@ -86,10 +92,8 @@ if device == 'cuda':
     cudnn.benchmark = True
 """
 
-PRETRAIN_PATH = "./resnet18_pretrained.pth"
-#PRETRAIN_PATH = "./vgg_pretrained.pth"
-TRAIN_PATH = "./resnet18_pretrained.pth"
-#TRAIN_PATH = "./vgg_pretrained.pth"
+polarity = "positive" if adc_utils.positive_weights else "bipolar"
+PRETRAIN_PATH = "./" + "_".join([net_name, "pretrained", polarity]) + ".pth"
 if os.path.exists(PRETRAIN_PATH):
     checkpoint = torch.load(PRETRAIN_PATH)
     if 'net' in checkpoint:
@@ -121,8 +125,6 @@ def change_mode(mode):
     for m in net.modules():
         if hasattr(m, "mode"):
             m.mode = mode
-    if mode == "quantize":
-        net.prepare_for_quantized_training()
 
 # Training
 def train(epoch):
@@ -149,7 +151,7 @@ def train(epoch):
 
 
 def test(epoch, mode="train"):
-    SAVE_PATH = PRETRAIN_PATH if mode=="pretrain" else TRAIN_PATH
+    SAVE_PATH = PRETRAIN_PATH
 
     global best_acc
     net.eval()
@@ -199,9 +201,6 @@ if adc_utils.positive_weights:
             # counter += 1
 
 change_mode("float")
-PRETRAIN_PATH = "./vgg_pretrained_quant.pth"
-#PRETRAIN_PATH = "./resnet18_pretrained.pth"
-#PRETRAIN_PATH = "./resnet18_cifar_sgd_positive_weights.pth" if adc_utils.positive_weights else "./resnet18_cifar_sgd.pth"
 if not os.path.exists(PRETRAIN_PATH):
     logger.log("PRETRAINING FLOATING POINT NETWORK")
     pretrain_accuracy = run_training(mode="pretrain")
@@ -222,12 +221,14 @@ change_mode("observe")
 observe_data()
 
 logger.log("ASSIGNING BEST RANGE")
+# Approach 1: Using dummy inputs
+"""
 for m in net.modules():
     if args.per_layer_granularity:
         if hasattr(m, 'best_range_start'):
             best_range_start = args.best_range_start
             best_metric_val = float('inf') # lower difference is better
-            min_best_range_start = max(best_range_start-args.range_delta, 0)
+            min_best_range_start = max(best_range_start, 0)
             max_best_range_start = min(best_range_start+args.range_delta, 23)
             num_trials = 3
             weight_orig = m.weight
@@ -235,8 +236,6 @@ for m in net.modules():
             shape = (num_trials, m.weight.shape[1], 5, 5)
             dummy_inputs = torch.normal(torch.ones(shape)*0., torch.ones(shape)*0.1).cuda()
             for best_range_start_i in range(min_best_range_start, max_best_range_start+1):
-                # Approach 1: Using dummy inputs
-                """
                 total_difference = 0.
                 for trial_i in range(num_trials):
                     dummy_input = dummy_inputs[trial_i:trial_i+1]
@@ -249,11 +248,7 @@ for m in net.modules():
                     difference = torch.norm(output_fq-output_orig)
                     total_difference += float(difference)
                 avg_difference = total_difference / num_trials
-                curr_metric_val = float(avg_difference)
-                """
-
-                # Approach 2: Using test dataset
-                
+                curr_metric_val = float(avg_difference) 
 
                 if curr_metric_val < best_metric_val:
                     best_range_start = best_range_start_i
@@ -261,11 +256,44 @@ for m in net.modules():
             m.best_range_start = best_range_start
     else:
         m.best_range_start = args.best_range_start
+"""
+
+change_mode("quantize_calc_error")
+
+# Approach 2: Using test dataset
+min_best_range_start = max(args.best_range_start-args.range_delta, 0)
+max_best_range_start = min(args.best_range_start+args.range_delta, 23)
+for best_range_start_i in range(min_best_range_start, max_best_range_start+1):
+    for m in net.modules():
+        if hasattr(m, "best_range_start"):
+            m.best_range_start = best_range_start_i
+    for i, data in enumerate(testloader):
+        images, labels = data
+        images, labels = images.to(device), labels.to(device)
+        # calculate outputs by running images through the network
+        outputs = net(images)
+        break
+
+if args.per_layer_granularity:
+    for m_i, m in enumerate(net.modules()):
+        if hasattr(m, 'bit_errors'):
+            m_best_range_start = None
+            min_val = float('inf')
+            for k, v in m.bit_errors.items():
+                if v < min_val:
+                    min_val = v
+                    m_best_range_start = k
+            m.best_range_start = m_best_range_start
+            print(f"\tPicking start bit {m.best_range_start} for module #{m_i}.")
+else:
+    for m in net.modules():
+        if hasattr(m, 'best_range_start'):
+            m.best_range_start = args.best_range_start
+    print(f"\tPicking start bit {args.best_range_start} for all modules.")
 
 logger.log("TESTING QUANTIZED NETWORK")
-#train_accuracy = run_training(mode="train")
 change_mode("quantize")
+#train_accuracy = run_training(mode="train")
 test_accuracy = test(0)
 
 logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
-logger.log(str(args.best_range_start) + ", " + str(test_accuracy))

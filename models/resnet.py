@@ -20,22 +20,28 @@ class BasicBlock(nn.Module):
         super(BasicBlock, self).__init__()
         self.conv1 = Conv2dClass(
             in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.conv1.relu = True
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = Conv2dClass(planes, planes, kernel_size=3,
                                stride=1, padding=1, bias=False)
+        self.conv2.relu = False
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion*planes:
+            conv_layer = Conv2dClass(in_planes, self.expansion*planes,
+                kernel_size=1, stride=stride, bias=False)
+            conv_layer.relu = False
             self.shortcut = nn.Sequential(
-                Conv2dClass(in_planes, self.expansion*planes,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
+                conv_layer,
+                #nn.BatchNorm2d(self.expansion*planes)
             )
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+        #out = self.conv1(x)
+        #out = self.conv2(out)
         out += self.shortcut(x)
         out = F.relu(out)
         return out
@@ -47,20 +53,25 @@ class Bottleneck(nn.Module):
     def __init__(self, in_planes, planes, stride=1):
         super(Bottleneck, self).__init__()
         self.conv1 = Conv2dClass(in_planes, planes, kernel_size=1, bias=False)
+        self.conv1.relu = True
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = Conv2dClass(planes, planes, kernel_size=3,
                                stride=stride, padding=1, bias=False)
+        self.conv2.relu = True
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = Conv2dClass(planes, self.expansion *
                                planes, kernel_size=1, bias=False)
+        self.conv3.relu = False
         self.bn3 = nn.BatchNorm2d(self.expansion*planes)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion*planes:
+            conv_layer = Conv2dClass(in_planes, self.expansion*planes,
+                    kernel_size=1, stride=stride, bias=False)
+            conv_layer.relu = False
             self.shortcut = nn.Sequential(
-                Conv2dClass(in_planes, self.expansion*planes,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
+                conv_layer,
+                #nn.BatchNorm2d(self.expansion*planes)
             )
 
     def forward(self, x):
@@ -79,6 +90,7 @@ class ResNet(nn.Module):
 
         self.conv1 = Conv2dClass(3, 64, kernel_size=3,
                                stride=1, padding=1, bias=False)
+        self.conv1.relu = True
         self.bn1 = nn.BatchNorm2d(64)
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
@@ -91,11 +103,6 @@ class ResNet(nn.Module):
             if p.__class__.__name__ == "Conv2dClass":
                 p.initialize_observers()
     
-    def prepare_for_quantized_training(self):
-        for p in self.modules():
-            if p.__class__.__name__ == "Conv2dClass":
-                p.prepare_for_quantized_training()
-
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []

@@ -13,7 +13,7 @@ partial_sum_size=256
 input_bit=8
 weight_bit=6
 acc_output_bit=24
-output_bit=16
+output_bit=8
 
 act_scale = 1/100.
 weight_scale = 1/100.
@@ -81,15 +81,21 @@ class ADC_Dequantize(torch.autograd.Function):
         output_adc_q = y
 
         output_adc_q = torch.round(output_adc_q)
-        output_adc_q = torch.clamp(output_adc_q, -2**(acc_output_bit-1), 2**(acc_output_bit-1)-1)
-            
+        #output_adc_q = torch.clamp(output_adc_q, -2**(acc_output_bit-1), 2**(acc_output_bit-1)-1)
+         
+        range_abs_min_val = 2**(best_range_start-output_bit+1)
+        range_abs_max_val = 2**best_range_start
+        output_adc_q = torch.sign(output_adc_q)*torch.clamp(torch.abs(output_adc_q), range_abs_min_val, range_abs_max_val)
+
+        """
         # Remove higher bits with modulus
-        output_adc_q = torch.sign(output_adc_q) * (torch.abs(output_adc_q) % (2 ** (best_range_start)))
+        output_adc_q = torch.sign(output_adc_q) * (torch.abs(output_adc_q) % (2 ** best_range_start))
         
         # Remove lower bits with division
         val = (2 ** (best_range_start-output_bit+1))
         output_adc_q = output_adc_q // val
         output_adc_q = output_adc_q * val
+        """
         
         # Dequantize
         y_scales = torch.Tensor([float(x_scales) * float(w_scales)]).cuda()
@@ -127,9 +133,6 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
 
         self.observers_initialized = False
        
-    def reset_bit_errors(self):
-        self.bit_errors = {}
- 
     def initialize_observers(self):
         self.observers_initialized = True
         self.input_observer = ObserverCls(quant_min=-2**(self.input_bit-1), quant_max=2**(self.input_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint8).to(device)
@@ -155,7 +158,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
             
             #self.output_observer.forward(output)
             res = output
-        elif self.mode == "quantize":
+        elif self.mode in ["quantize", "quantize_calc_error"]:
             # x, observer, input_bit
             input_q = Quantize.apply(input, self.input_observer, self.input_bit)
             weight_q = Quantize.apply(weight, None, self.weight_bit)
@@ -174,25 +177,27 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
                     output_q_slice = F.conv2d(input_q_slice, weight_q_slice, bias, self.stride,
                                     self.padding, self.dilation, self.groups)
                 
+                bits = int(torch.ceil(torch.log(torch.mean(torch.abs(output_q_slice).cpu()))/torch.log(torch.Tensor([2.])))+1)
                 output_slice_adq = ADC_Dequantize.apply(self.input_observer, weight, output_q_slice, self.output_bit, self.best_range_start)
+                
                 output_adq += output_slice_adq
             
             res = output_adq
 
-            # calculate and store error
-            if self.padding_mode != 'zeros':
-                output = F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                weight, bias, self.stride,
-                                _pair(0), self.dilation, self.groups)
-            else:
-                output = F.conv2d(input, weight, bias, self.stride,
-                                self.padding, self.dilation, self.groups)
-            float_res = output
-            error = torch.norm(res - float_res)
-            if self.best_range_start not in self.bit_errors.keys():
-                self.bit_errors[self.best_start_range] = error
-            else:
-                self.bit_errors[self.best_start_range] += error
+            if self.mode == "quantize_calc_error":
+                # calculate and store error
+                if self.padding_mode != 'zeros':
+                    output = F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                                    weight, bias, self.stride,
+                                    _pair(0), self.dilation, self.groups)
+                else:
+                    output = F.conv2d(input, weight, bias, self.stride,
+                                    self.padding, self.dilation, self.groups)
+                
+                float_res = output
+                error = float(torch.norm(res - float_res))
+                self.bit_errors[self.best_range_start] = error
+                res = float_res
         elif self.mode == "float":
             if self.padding_mode != 'zeros':
                 output = F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
