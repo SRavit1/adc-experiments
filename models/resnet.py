@@ -9,7 +9,7 @@ Reference:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from adc_utils import ThresholdSiLU, ADC_Conv2d
+from adc_utils import ADC_Conv2d
 
 Conv2dClass = ADC_Conv2d
 
@@ -24,24 +24,21 @@ class BasicBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = Conv2dClass(planes, planes, kernel_size=3,
                                stride=1, padding=1, bias=False)
-        self.conv2.relu = False
+        self.conv1.relu = False
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion*planes:
             conv_layer = Conv2dClass(in_planes, self.expansion*planes,
                 kernel_size=1, stride=stride, bias=False)
-            conv_layer.relu = False
             self.shortcut = nn.Sequential(
                 conv_layer,
-                #nn.BatchNorm2d(self.expansion*planes)
+                nn.BatchNorm2d(self.expansion*planes)
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        #out = self.conv1(x)
-        #out = self.conv2(out)
+        out = self.conv1(x) #self.bn1(F.relu(self.conv1(x)))
+        out = self.conv2(out) #self.bn2(self.conv2(out))
         out += self.shortcut(x)
         out = F.relu(out)
         return out
@@ -71,13 +68,13 @@ class Bottleneck(nn.Module):
             conv_layer.relu = False
             self.shortcut = nn.Sequential(
                 conv_layer,
-                #nn.BatchNorm2d(self.expansion*planes)
+                nn.BatchNorm2d(self.expansion*planes)
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
+        out = self.conv1(x) #self.bn1(F.relu(self.conv1(x)))
+        out = self.conv2(x) #self.bn2(F.relu(self.conv2(out)))
+        out = self.conv3(x) #self.bn3(self.conv3(out))
         out += self.shortcut(x)
         out = F.relu(out)
         return out
@@ -90,7 +87,6 @@ class ResNet(nn.Module):
 
         self.conv1 = Conv2dClass(3, 64, kernel_size=3,
                                stride=1, padding=1, bias=False)
-        self.conv1.relu = True
         self.bn1 = nn.BatchNorm2d(64)
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
@@ -112,7 +108,7 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn1(F.relu(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 
-from adc_utils import ThresholdSiLU, ADC_Conv2d
+from adc_utils import ADC_Conv2d
 
 Conv2dClass = ADC_Conv2d
 
@@ -36,10 +36,8 @@ class VGG(nn.Module):
                 layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
             else:
                 layers += [Conv2dClass(in_channels, x, kernel_size=3, padding=1),
-                           nn.BatchNorm2d(x),
-                           nn.ReLU(inplace=True)]
-                #layers += [Conv2dClass(in_channels, x, kernel_size=3, padding=1)]
-                layers[-1].relu = True
+                           nn.ReLU(inplace=True),
+                           nn.BatchNorm2d(x)]
                 in_channels = x
         layers += [nn.AvgPool2d(kernel_size=1, stride=1)]
         return nn.Sequential(*layers)

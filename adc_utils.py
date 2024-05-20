@@ -7,117 +7,64 @@ from torch.nn.modules.utils import _pair
 from torch.ao.quantization.observer import MinMaxObserver, HistogramObserver
 import math
 
-ObserverCls = HistogramObserver #MinMaxObserver
+ObserverCls = MinMaxObserver #HistogramObserver
 
 partial_sum_size=256
 input_bit=8
-weight_bit=6
+weight_bit=8
 acc_output_bit=24
 output_bit=8
-
-act_scale = 1/100.
-weight_scale = 1/100.
-
-positive_weights=False #True
+range_start = 12
+range_delta = 2
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-class ThresholdSiLU(torch.nn.SiLU):
-    def __init__(self, **kwargs):
-        super().__init__(kwargs)
-        self.input_threshold = torch.nn.Parameter(torch.tensor(0.))
-    
-    def forward(self, input_):
-        # TODO: Change back to original
-        return torch.nn.functional.relu(input_)
-        #return super().forward(input_-self.input_threshold)
-
-class Quantize(torch.autograd.Function):
+"""
+x- tensor to be quantized
+observer- provides s/zp
+quant_bits- if observer None, number of bits to quantize to
+clamp_bits- None -> no clamping, not None -> clamp in given signed range
+clamp_start_range- where clamping should start from
+clamp_start_delta- number of nearby bits in which to search for clamp_start_range
+"""
+class FakeQuantize(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, observer, input_bit):
+    def forward(ctx, x, observer, quant_bits, clamp_bits, clamp_start_range, clamp_start_delta):
         if observer is not None:
-            #observer = ObserverCls(quant_min=-2**(input_bit-1), quant_max=2**(input_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint8).to(device)
-            #observer.forward(x)
             scales, zero_points = observer.calculate_qparams()
-            zero_points = 0
+            zero_points = 0.
             input_min, input_max = observer.quant_min, observer.quant_max
         else:        
-            #scales = (x.max()-x.min())/(2**input_bit)
-            #zero_points = (x.max()+x.min())/2
-            scales = 2*torch.max(torch.abs(x.max()), torch.abs(x.min()))/(2**input_bit)
-            zero_points = 0
+            scales = 2*torch.max(torch.abs(x.max()), torch.abs(x.min()))/(2**quant_bits)
+            zero_points = 0.
             input_min, input_max = -2**(input_bit-1), 2**(input_bit-1)-1
-        zero_points = 0. 
-        #scales = act_scale if input_bit==input_bit else weight_scale
-        x_q = x
-        x_q = (x_q - zero_points) / scales
-        #x_q = (x_q/scales) - zero_points
-        x_q = torch.round(x_q)
-        x_q = torch.clamp(x_q, input_min, input_max)
-
-        #x_q = (x_q * scales) + zero_points
-
-        ctx.scales = scales
-
-        return x_q
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output/ctx.scales, None, None, None
-
-class ADC_Dequantize(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x_observer, w, y, output_bit, best_range_start):
-        #observer = ObserverCls(quant_min=-2**(input_bit-1), quant_max=2**(input_bit-1)-1, qscheme=torch.per_tensor_symmetric).to(device)
-        #observer.forward(x)
-        x_scales, x_zero_points = x_observer.calculate_qparams()
-        x_zero_points = 0
-             
-        #scales = (x.max()-x.min())/(2**input_bit)
-        #zero_points = (x.max()+x.min())/2
-        w_scales = 2*torch.max(torch.abs(w.max()), torch.abs(w.min()))/(2**weight_bit)
-        w_zero_points = 0
-
-        output_adc_q = y
-
-        output_adc_q = torch.round(output_adc_q)
-        #output_adc_q = torch.clamp(output_adc_q, -2**(acc_output_bit-1), 2**(acc_output_bit-1)-1)
          
-        range_abs_min_val = 2**(best_range_start-output_bit+1)
-        range_abs_max_val = 2**best_range_start
-        output_adc_q = torch.sign(output_adc_q)*torch.clamp(torch.abs(output_adc_q), range_abs_min_val, range_abs_max_val)
+        # Quantize
+        x = (x - zero_points) / scales
+        x = torch.round(x)
+        x = torch.clamp(x, input_min, input_max)
 
-        """
-        # Remove higher bits with modulus
-        output_adc_q = torch.sign(output_adc_q) * (torch.abs(output_adc_q) % (2 ** best_range_start))
-        
-        # Remove lower bits with division
-        val = (2 ** (best_range_start-output_bit+1))
-        output_adc_q = output_adc_q // val
-        output_adc_q = output_adc_q * val
-        """
-        
+        # Clamp (assume unsigned number, since after ReLU)
+        if not clamp_bits is None:
+            if not clamp_start_delta == 0:
+                min_error = float('inf')
+                min_search_val = torch.min(clamp_start_range-clamp_start_delta, 0)
+                max_search_val = torch.max(clamp_start_range+clamp_start_delta, clamp_bits-1)
+                for clamp_start_range_i in range(min_search_val, max_search_val+1):
+                    curr_error = 0
+                    if curr_error < min_error:
+                        clamp_start_range = clamp_start_range_i
+                        min_error = curr_error
+            x = torch.clamp(x, 2**(clamp_start_range+1-clamp_bits), 2**(clamp_start_range+1)-1)
+
         # Dequantize
-        y_scales = torch.Tensor([float(x_scales) * float(w_scales)]).cuda()
-        #y_scales = float(x_scales) * float(w_scales)
-        output_adc_q = output_adc_q * y_scales
+        x = (x * scales) + zero_points
 
-        y = output_adc_q
-
-        ctx.y_scales = y_scales
-
-        return y
+        return x
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, grad_output*ctx.y_scales, None, None
-
-class ReLU_STE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return torch.nn.functional.relu(x)
-    def backward(ctx, grad_output):
-        return grad_output
+        return grad_output, None, None, None
 
 class ADC_Conv2d(torch.nn.modules.Conv2d):
     def __init__(self, *kargs, **kwargs):
@@ -126,87 +73,89 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         self.acc_output_bit = acc_output_bit
         self.output_bit = output_bit
         self.weight_bit = weight_bit
-        self.best_range_start = 0
+        self.range_start = range_start
+        self.range_delta = range_delta
         self.mode = "quantize" #"observe", "quantize", "float"
 
-        self.bit_errors = {}
-
+        self.bn = torch.nn.BatchNorm2d(self.out_channels)
+        self.relu = False
+        
         self.observers_initialized = False
        
     def initialize_observers(self):
         self.observers_initialized = True
         self.input_observer = ObserverCls(quant_min=-2**(self.input_bit-1), quant_max=2**(self.input_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint8).to(device)
-        #self.output_observer = ObserverCls(quant_min=-2**(self.acc_output_bit-1), quant_max=2**(self.acc_output_bit-1)-1, qscheme=torch.per_tensor_symmetric).to(device)
+        self.output_observer = ObserverCls(quant_min=-2**(self.acc_output_bit-1), quant_max=2**(self.acc_output_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint32).to(device)
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
-        # if positive_weights:
-        #     weight = ReLU_STE.apply(weight)
-        # weight = torch.abs(weight)
+        input_, weight_ = input, weight
+
+        if self.mode == "float":
+            if self.padding_mode != 'zeros':
+                output = F.conv2d(F.pad(input_, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                                weight_, bias, self.stride,
+                                _pair(0), self.dilation, self.groups)
+            else:
+                output = F.conv2d(input_, weight_, bias, self.stride,
+                                self.padding, self.dilation, self.groups)
+            output = self.bn(output)
+            if self.relu:
+                output = torch.relu(output)
+            return output
+
+        if self.mode == "quantize":
+            input_fq = FakeQuantize.apply(input, self.input_observer, self.input_bit, None, None, None)
+            weight_fq = FakeQuantize.apply(weight, None, self.weight_bit, None, None, None)
+            input_, weight_ = input_fq, weight_fq
 
         if self.mode == "observe":
             if not self.observers_initialized:
-                self.initialize_observers()
-            
+                self.initialize_observers() 
             self.input_observer.forward(input)
-            if self.padding_mode != 'zeros':
-                output = F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                weight, bias, self.stride,
-                                _pair(0), self.dilation, self.groups)
-            else:
-                output = F.conv2d(input, weight, bias, self.stride,
-                                self.padding, self.dilation, self.groups)
-            
-            #self.output_observer.forward(output)
-            res = output
-        elif self.mode in ["quantize", "quantize_calc_error"]:
-            # x, observer, input_bit
-            input_q = Quantize.apply(input, self.input_observer, self.input_bit)
-            weight_q = Quantize.apply(weight, None, self.weight_bit)
-            # bias not used, so not quantizing
 
-            slice_num = math.ceil(partial_sum_size/(weight.shape[2]*weight.shape[3]))
-            output_adq = 0
+        input_pos = torch.relu(input_)
+        input_neg = -torch.relu(-input_)
+        weight_pos = torch.relu(weight_)
+        weight_neg = torch.relu(-weight_)
+        assert torch.allclose(weight_, weight_pos-weight_neg)
+        conv_inputs = [(input_, weight_, 1.)]
+        #conv_inputs = [(input_, weight_pos, 1.), (input_, weight_neg, -1.)]
+
+        output = 0
+        for input_, weight_, sign in conv_inputs:
+            pass_output = 0
+            #slice_num = math.ceil(partial_sum_size/(weight_.shape[2]*weight_.shape[3]))
+            slice_num = weight.shape[1]
             for c in range(0, weight.shape[1], slice_num):
-                input_q_slice = input_q[:,c:c+slice_num,:,:]
-                weight_q_slice = weight_q[:,c:c+slice_num,:,:]
-                if self.padding_mode != 'zeros':
-                    output_q_slice = F.conv2d(F.pad(input_q_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                    weight_q_slice, bias, self.stride,
-                                    _pair(0), self.dilation, self.groups)
-                else:
-                    output_q_slice = F.conv2d(input_q_slice, weight_q_slice, bias, self.stride,
-                                    self.padding, self.dilation, self.groups)
-                
-                bits = int(torch.ceil(torch.log(torch.mean(torch.abs(output_q_slice).cpu()))/torch.log(torch.Tensor([2.])))+1)
-                output_slice_adq = ADC_Dequantize.apply(self.input_observer, weight, output_q_slice, self.output_bit, self.best_range_start)
-                
-                output_adq += output_slice_adq
-            
-            res = output_adq
+                input_slice = input_[:,c:c+slice_num,:,:]
+                weight_slice = weight_[:,c:c+slice_num,:,:]
 
-            if self.mode == "quantize_calc_error":
-                # calculate and store error
+                input_slice_pos = input_slice[input_slice>=0]
+                input_slice_neg = input_slice[input_slice<0]
+                weight_slice_pos = weight_slice[weight_slice>=0]
+                weight_slice_neg = weight_slice[weight_slice<0]
+
                 if self.padding_mode != 'zeros':
-                    output = F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                    weight, bias, self.stride,
+                    output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                                    weight_slice, bias, self.stride,
                                     _pair(0), self.dilation, self.groups)
                 else:
-                    output = F.conv2d(input, weight, bias, self.stride,
+                    output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
                                     self.padding, self.dilation, self.groups)
-                
-                float_res = output
-                error = float(torch.norm(res - float_res))
-                self.bit_errors[self.best_range_start] = error
-                res = float_res
-        elif self.mode == "float":
-            if self.padding_mode != 'zeros':
-                output = F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                weight, bias, self.stride,
-                                _pair(0), self.dilation, self.groups)
-            else:
-                output = F.conv2d(input, weight, bias, self.stride,
-                                self.padding, self.dilation, self.groups)
-            res = output
+
+                pass_output += output_slice
+
+            pass_output *= sign
+            output += pass_output
+        
+        pass_output = self.bn(pass_output)
+        if self.relu:
+            pass_output = torch.relu(pass_output)
+        
+        if self.mode == "observe":
+            self.output_observer.forward(output)
+        
+        res = output
         return res
 
     def forward(self, input: Tensor) -> Tensor:

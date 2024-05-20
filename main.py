@@ -1,4 +1,3 @@
-'''Train CIFAR10 with PyTorch.'''
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,15 +11,11 @@ from models import *
 from utils import progress_bar
 import logger
 import adc_utils
-import ast
-
-# 32-bit precision not enough, as DQ(Q(X)) is not X
-#torch.set_default_dtype(torch.float64)
 
 parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('--batch_size', default=32, help='Batch size.')
-parser.add_argument('--pretrain_epochs', default=50, help='number of epochs')
-parser.add_argument('--train_epochs', default=30, help='number of epochs')
+parser.add_argument('--pretrain_epochs', default=10, help='number of epochs')
+parser.add_argument('--train_epochs', default=3, help='number of epochs')
 parser.add_argument('--log_dir', default="./log.txt", help='path to save log in')
 parser.add_argument('--float', action='store_true', help='test floating point model')
 parser.add_argument('--best_range_start', default=12, type=int, help='upper bit of best 8-bit range')
@@ -35,6 +30,11 @@ logger = logger.Logger(args.log_dir)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+
+net_name = 'ResNet18'
+polarity = "bipolar" #"positive" if adc_utils.positive_weights else "bipolar"
+PRETRAIN_PATH = "./" + "_".join([net_name, "pretrained", polarity, "float"]) + ".pth"
+TRAIN_PATH = "./" + "_".join([net_name, "pretrained", polarity, "quant"]) + ".pth"
 
 # Data
 print('==> Preparing data..')
@@ -63,7 +63,6 @@ testloader = torch.utils.data.DataLoader(
 classes = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
 
-net_name = 'VGG'
 net_dict = {
     'VGG': VGG,
     'ResNet18': ResNet18,
@@ -86,14 +85,8 @@ net_dict = {
 print('==> Building model..')
 net = net_dict[net_name]()
 net = net.to(device)
-"""
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
-"""
+print("INSTANTIATING " + net_name)
 
-polarity = "positive" if adc_utils.positive_weights else "bipolar"
-PRETRAIN_PATH = "./" + "_".join([net_name, "pretrained", polarity]) + ".pth"
 if os.path.exists(PRETRAIN_PATH):
     checkpoint = torch.load(PRETRAIN_PATH)
     if 'net' in checkpoint:
@@ -151,7 +144,7 @@ def train(epoch):
 
 
 def test(epoch, mode="train"):
-    SAVE_PATH = PRETRAIN_PATH
+    SAVE_PATH = PRETRAIN_PATH if mode=="pretrain" else TRAIN_PATH
 
     global best_acc
     net.eval()
@@ -179,26 +172,11 @@ def test(epoch, mode="train"):
     return acc
 
 def run_training(mode="train"):
-    for epoch in range(0, args.train_epochs):
+    EPOCHS = args.train_epochs if mode=="train" else args.pretrain_epochs
+    for epoch in range(0, EPOCHS):
         train(epoch)
         test(epoch, mode=mode)
         scheduler.step()
-
-if adc_utils.positive_weights:
-    counter = 0
-    for m in net.modules():
-        if isinstance(m, torch.nn.modules.Conv2d):
-            # from matplotlib import pyplot as plt
-            # plt.hist(m.weight.data.cpu().flatten().numpy(), label="before")
-            
-            m.weight.data = m.weight.data + 2*torch.sqrt(torch.var(m.weight.data))
-            m.weight.data = torch.nn.functional.relu(m.weight.data)
-
-            # plt.hist(m.weight.data.cpu().flatten().numpy(), label="after")
-            # plt.legend()
-            # plt.savefig("./hists/fig_" + str(counter) + ".png")
-            # plt.clf()
-            # counter += 1
 
 change_mode("float")
 if not os.path.exists(PRETRAIN_PATH):
@@ -207,8 +185,6 @@ if not os.path.exists(PRETRAIN_PATH):
 else:
     logger.log("LOADING PRETRAINED FLOATING POINT NETWORK")
     net.load_state_dict(torch.load(PRETRAIN_PATH), strict=False)
-    #pretrain_accuracy = run_training(mode="pretrain")
-    #pretrain_accuracy = run_training(args.pretrain_epochs, trainloader, testloader, PRETRAIN_PATH, mode="pretrain")
 
 if args.float:
     change_mode("float")
@@ -220,80 +196,9 @@ logger.log("OBSERVING DATA")
 change_mode("observe")
 observe_data()
 
-logger.log("ASSIGNING BEST RANGE")
-# Approach 1: Using dummy inputs
-"""
-for m in net.modules():
-    if args.per_layer_granularity:
-        if hasattr(m, 'best_range_start'):
-            best_range_start = args.best_range_start
-            best_metric_val = float('inf') # lower difference is better
-            min_best_range_start = max(best_range_start, 0)
-            max_best_range_start = min(best_range_start+args.range_delta, 23)
-            num_trials = 3
-            weight_orig = m.weight
-            
-            shape = (num_trials, m.weight.shape[1], 5, 5)
-            dummy_inputs = torch.normal(torch.ones(shape)*0., torch.ones(shape)*0.1).cuda()
-            for best_range_start_i in range(min_best_range_start, max_best_range_start+1):
-                total_difference = 0.
-                for trial_i in range(num_trials):
-                    dummy_input = dummy_inputs[trial_i:trial_i+1]
-                    with torch.no_grad():
-                        change_mode("quantize")
-                        m.best_range_start = best_range_start_i
-                        output_fq = m.forward(dummy_input.clone())
-                        change_mode("float")
-                        output_orig = m.forward(dummy_input.clone())
-                    difference = torch.norm(output_fq-output_orig)
-                    total_difference += float(difference)
-                avg_difference = total_difference / num_trials
-                curr_metric_val = float(avg_difference) 
-
-                if curr_metric_val < best_metric_val:
-                    best_range_start = best_range_start_i
-                    best_metric_val = curr_metric_val
-            m.best_range_start = best_range_start
-    else:
-        m.best_range_start = args.best_range_start
-"""
-
-change_mode("quantize_calc_error")
-
-# Approach 2: Using test dataset
-min_best_range_start = max(args.best_range_start-args.range_delta, 0)
-max_best_range_start = min(args.best_range_start+args.range_delta, 23)
-for best_range_start_i in range(min_best_range_start, max_best_range_start+1):
-    for m in net.modules():
-        if hasattr(m, "best_range_start"):
-            m.best_range_start = best_range_start_i
-    for i, data in enumerate(testloader):
-        images, labels = data
-        images, labels = images.to(device), labels.to(device)
-        # calculate outputs by running images through the network
-        outputs = net(images)
-        break
-
-if args.per_layer_granularity:
-    for m_i, m in enumerate(net.modules()):
-        if hasattr(m, 'bit_errors'):
-            m_best_range_start = None
-            min_val = float('inf')
-            for k, v in m.bit_errors.items():
-                if v < min_val:
-                    min_val = v
-                    m_best_range_start = k
-            m.best_range_start = m_best_range_start
-            print(f"\tPicking start bit {m.best_range_start} for module #{m_i}.")
-else:
-    for m in net.modules():
-        if hasattr(m, 'best_range_start'):
-            m.best_range_start = args.best_range_start
-    print(f"\tPicking start bit {args.best_range_start} for all modules.")
-
 logger.log("TESTING QUANTIZED NETWORK")
 change_mode("quantize")
 #train_accuracy = run_training(mode="train")
-test_accuracy = test(0)
+test_accuracy = test(0, mode="train")
 
 logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
