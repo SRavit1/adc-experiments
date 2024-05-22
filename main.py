@@ -12,17 +12,14 @@ from utils import progress_bar
 import logger
 import adc_utils
 
+quantize_mode=False
+
 parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('--batch_size', default=32, help='Batch size.')
-parser.add_argument('--pretrain_epochs', default=10, help='number of epochs')
-parser.add_argument('--train_epochs', default=3, help='number of epochs')
+parser.add_argument('--train_epochs', default=30, help='number of epochs')
 parser.add_argument('--log_dir', default="./log.txt", help='path to save log in')
-parser.add_argument('--float', action='store_true', help='test floating point model')
-parser.add_argument('--best_range_start', default=12, type=int, help='upper bit of best 8-bit range')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--range_delta', default=4, type=int, help='best range delta for quantization')
 parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
-parser.add_argument('--per_layer_granularity', action='store_true', help='whether to apply per-tensor granularity')
 args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
@@ -30,14 +27,13 @@ logger = logger.Logger(args.log_dir)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+n_epochs = args.train_epochs
 
 net_name = 'ResNet18'
-polarity = "bipolar" #"positive" if adc_utils.positive_weights else "bipolar"
-PRETRAIN_PATH = "./" + "_".join([net_name, "pretrained", polarity, "float"]) + ".pth"
-TRAIN_PATH = "./" + "_".join([net_name, "pretrained", polarity, "quant"]) + ".pth"
+FLOAT_CKPT_PATH = "./" + "_".join([net_name, "float"]) + ".pth"
+QUANT_CKPT_PATH = "./" + "_".join([net_name, "quant"]) + ".pth"
+CKPT_PATH = FLOAT_CKPT_PATH
 
-# Data
-print('==> Preparing data..')
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
@@ -81,24 +77,6 @@ net_dict = {
     'SimpleDLA': SimpleDLA
 }
 
-# Model
-print('==> Building model..')
-net = net_dict[net_name]()
-net = net.to(device)
-print("INSTANTIATING " + net_name)
-
-if os.path.exists(PRETRAIN_PATH):
-    checkpoint = torch.load(PRETRAIN_PATH)
-    if 'net' in checkpoint:
-        checkpoint = checkpoint['net']
-    net.load_state_dict(checkpoint, strict=False)
-
-
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr,
-                      momentum=0.9, weight_decay=5e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
-
 def observe_data():
     # since we're not training, we don't need to calculate the gradients for our outputs
     with torch.no_grad():
@@ -107,19 +85,7 @@ def observe_data():
             images, labels = images.to(device), labels.to(device)
             # calculate outputs by running images through the network
             outputs = net(images)
-    return
 
-def get_mode():
-    for m in net.modules():
-        if hasattr(m, "mode"):
-            return m.mode
-
-def change_mode(mode):
-    for m in net.modules():
-        if hasattr(m, "mode"):
-            m.mode = mode
-
-# Training
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net.train()
@@ -132,7 +98,15 @@ def train(epoch):
         outputs = net(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
+        if adc_utils.mode=="quantize":
+            for p in net.modules():
+                if isinstance(p, nn.Conv2d):
+                    p.weight.data.copy_(p.weight_org)
         optimizer.step()
+        if adc_utils.mode=="quantize":
+            for p in net.modules():
+                if isinstance(p, nn.Conv2d):
+                    p.weight_org.data.copy_(p.weight.data)
 
         train_loss += loss.item()
         _, predicted = outputs.max(1)
@@ -142,10 +116,7 @@ def train(epoch):
         progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                      % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-
-def test(epoch, mode="train"):
-    SAVE_PATH = PRETRAIN_PATH if mode=="pretrain" else TRAIN_PATH
-
+def test(epoch):
     global best_acc
     net.eval()
     test_loss = 0
@@ -168,37 +139,44 @@ def test(epoch, mode="train"):
     # Save checkpoint.
     acc = 100.*correct/total
     if acc > best_acc:
-        torch.save(net.state_dict(), SAVE_PATH)
+        torch.save(net.state_dict(), CKPT_PATH)
     return acc
 
-def run_training(mode="train"):
-    EPOCHS = args.train_epochs if mode=="train" else args.pretrain_epochs
-    for epoch in range(0, EPOCHS):
+def run_training():
+    for epoch in range(0, n_epochs):
         train(epoch)
-        test(epoch, mode=mode)
+        test(epoch)
         scheduler.step()
 
-change_mode("float")
-if not os.path.exists(PRETRAIN_PATH):
-    logger.log("PRETRAINING FLOATING POINT NETWORK")
-    pretrain_accuracy = run_training(mode="pretrain")
-else:
-    logger.log("LOADING PRETRAINED FLOATING POINT NETWORK")
-    net.load_state_dict(torch.load(PRETRAIN_PATH), strict=False)
+logger.log("INSTANTIATING " + net_name)
+net = net_dict[net_name]()
+net = net.to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
-if args.float:
-    change_mode("float")
-    test_accuracy = test(0)
-    logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
-    exit(0)
+#if os.path.exists(QUANT_CKPT_PATH):
+#    logger.log("LOADING PRETRAINED QUANT WEIGHTS")
+#    net.load_state_dict(torch.load(QUANT_CKPT_PATH))
+if os.path.exists(FLOAT_CKPT_PATH):
+    logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
+    net.load_state_dict(torch.load(FLOAT_CKPT_PATH))
+else:
+    logger.log("PRETRAINING FLOATING NETWORK")
+    CKPT_PATH = FLOAT_CKPT_PATH
+    adc_utils.mode = "float"
+    train_accuracy = run_training()
 
 logger.log("OBSERVING DATA")
-change_mode("observe")
+adc_utils.mode = "observe"
 observe_data()
 
+logger.log("TRAINING QUANTIZED NETWORK")
+CKPT_PATH = QUANT_CKPT_PATH
+adc_utils.mode = "quantize"
+train_accuracy = run_training()
+
 logger.log("TESTING QUANTIZED NETWORK")
-change_mode("quantize")
-#train_accuracy = run_training(mode="train")
-test_accuracy = test(0, mode="train")
+test_accuracy = test(0)
 
 logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
