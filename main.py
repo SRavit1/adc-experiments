@@ -20,6 +20,7 @@ parser.add_argument('--train_epochs', default=30, help='number of epochs')
 parser.add_argument('--log_dir', default="./log.txt", help='path to save log in')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
+parser.add_argument('--eval', action='store_true', help='evaluate on dataset')
 args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
@@ -155,9 +156,6 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
-#if os.path.exists(QUANT_CKPT_PATH):
-#    logger.log("LOADING PRETRAINED QUANT WEIGHTS")
-#    net.load_state_dict(torch.load(QUANT_CKPT_PATH))
 if os.path.exists(FLOAT_CKPT_PATH):
     logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
     net.load_state_dict(torch.load(FLOAT_CKPT_PATH))
@@ -167,16 +165,19 @@ else:
     adc_utils.mode = "float"
     train_accuracy = run_training()
 
-logger.log("OBSERVING DATA")
-adc_utils.mode = "observe"
-observe_data()
-
-logger.log("TRAINING QUANTIZED NETWORK")
-CKPT_PATH = QUANT_CKPT_PATH
-adc_utils.mode = "quantize"
-train_accuracy = run_training()
-
-logger.log("TESTING QUANTIZED NETWORK")
+adc_utils.mode = "float"
 test_accuracy = test(0)
+logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
 
-logger.log("TESTING ACCURACY IS: " + str(test_accuracy))
+#logger.log("OBSERVING DATA")
+#adc_utils.mode = "observe"
+#observe_data()
+
+adc_utils.mode = "quantize"
+if not args.eval:
+    logger.log("TRAINING QUANTIZED NETWORK")
+    CKPT_PATH = QUANT_CKPT_PATH
+    train_accuracy = run_training()
+
+test_accuracy = test(0)
+logger.log("QUANTIZED TESTING ACCURACY IS: " + str(test_accuracy))
