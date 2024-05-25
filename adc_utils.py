@@ -16,8 +16,10 @@ partial_sum_size=256
 input_bit=8
 weight_bit=6
 output_bit=8
+range_mode="minimum"
 range_start=None
 mode = "quantize"
+truncate = False
 
 def get_quant_values(input, observer, bitwidth, signedness='s'):
     """
@@ -27,10 +29,12 @@ def get_quant_values(input, observer, bitwidth, signedness='s'):
     min_ = 0
     max_ = (2**bitwidth)-1
     """
+    #"""
     s = torch.max(torch.abs(input)) / (2**bitwidth - 1)
     zp = 0
     min_ = -2**(bitwidth-1)
     max_ = 2**(bitwidth-1)-1
+    #"""
     return s, zp, min_, max_
     if observer is not None:
         min_, max_ = observer.quant_min, observer.quant_max
@@ -74,12 +78,22 @@ class FakeTruncate(torch.autograd.Function):
         # Quantize
         y_q = y / (x_s * w_s)
 
-        if range_start is None:
-            range_start = torch.ceil(torch.log(torch.max(y_q))/torch.log(torch.Tensor([2.]).to(y_q.device)))
-        y_q = torch.sign(y_q) * torch.clamp(torch.abs(y_q), 2**(range_start-(bitwidth-1)), (2**range_start)-1)
+        global truncate
+        if truncate:
+            if range_start is None or range_mode=="minimum":
+                range_start_temp = torch.ceil(torch.log(torch.max(y_q))/torch.log(torch.Tensor([2.]).to(y_q.device)))
+            if range_start is None:
+                range_start = 0
+            if range_mode=="minimum":
+                range_start = max(range_start, range_start_temp)
+
+            abs_clamp_min = 2**(range_start-1-(bitwidth-1))
+            abs_clamp_max = 2**(range_start-1)-1
+            y_q = torch.sign(y_q) * torch.clamp(torch.abs(y_q), abs_clamp_min, abs_clamp_max)
 
         # Dequantize
         y_fq = y_q * (x_s * w_s)
+        #y_fq += torch.randint(2, (y_fq.shape[0],1,1,1)).to(y_fq.device) * 1e-3
 
         return y_fq
 
@@ -106,6 +120,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         if mode == "quantize":
             if not self.observers_initialized:
                 self.initialize_observers() 
+            x_s, x_zp, w_s, w_zp = 1, 0, 1, 0
             input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, input_bit)
             weight_.data, w_s, w_zp = FakeQuantize.apply(self.weight_org, None, weight_bit)
 

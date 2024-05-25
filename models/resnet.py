@@ -37,7 +37,7 @@ class BasicBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = self.bn1(F.relu(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
         out = F.relu(out)
@@ -54,11 +54,9 @@ class Bottleneck(nn.Module):
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = Conv2dClass(planes, planes, kernel_size=3,
                                stride=stride, padding=1, bias=False)
-        self.conv2.relu = True
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = Conv2dClass(planes, self.expansion *
                                planes, kernel_size=1, bias=False)
-        self.conv3.relu = False
         self.bn3 = nn.BatchNorm2d(self.expansion*planes)
 
         self.shortcut = nn.Sequential()
@@ -72,8 +70,8 @@ class Bottleneck(nn.Module):
             )
 
     def forward(self, x):
-        out = self.bn1(F.relu(self.conv1(x)))
-        out = self.bn2(F.relu(self.conv2(out)))
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
         out = self.bn3(self.conv3(out))
         out += self.shortcut(x)
         out = F.relu(out)
@@ -108,7 +106,7 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = self.bn1(F.relu(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)

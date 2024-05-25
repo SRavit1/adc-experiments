@@ -12,6 +12,8 @@ from utils import progress_bar
 import logger
 import adc_utils
 
+torch.autograd.set_detect_anomaly(True)
+
 quantize_mode=False
 
 parser = argparse.ArgumentParser(description='Process some integers.')
@@ -25,12 +27,11 @@ args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
 
+net_name = 'MobileNetV2'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 n_epochs = args.train_epochs
 
-net_name = 'ResNet18'
 FLOAT_CKPT_PATH = "./" + "_".join([net_name, "float"]) + ".pth"
 QUANT_CKPT_PATH = "./" + "_".join([net_name, "quant"]) + ".pth"
 CKPT_PATH = FLOAT_CKPT_PATH
@@ -116,9 +117,10 @@ def train(epoch):
 
         progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                      % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+    acc = 100.*correct/total
+    return acc
 
 def test(epoch):
-    global best_acc
     net.eval()
     test_loss = 0
     correct = 0
@@ -137,17 +139,22 @@ def test(epoch):
             progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                          % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-    # Save checkpoint.
     acc = 100.*correct/total
-    if acc > best_acc:
-        torch.save(net.state_dict(), CKPT_PATH)
     return acc
 
 def run_training():
+    best_train_acc = 0
+    best_test_acc = 0
     for epoch in range(0, n_epochs):
-        train(epoch)
-        test(epoch)
+        train_acc = train(epoch)
+        test_acc = test(epoch)
         scheduler.step()
+        if train_acc > best_train_acc:
+            best_train_acc = train_acc
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            torch.save(net.state_dict(), CKPT_PATH)
+    return best_train_acc, best_test_acc
 
 logger.log("INSTANTIATING " + net_name)
 net = net_dict[net_name]()
@@ -163,7 +170,7 @@ else:
     logger.log("PRETRAINING FLOATING NETWORK")
     CKPT_PATH = FLOAT_CKPT_PATH
     adc_utils.mode = "float"
-    train_accuracy = run_training()
+    train_accuracy, test_accuracy = run_training()
 
 adc_utils.mode = "float"
 test_accuracy = test(0)
@@ -173,11 +180,31 @@ logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
 #adc_utils.mode = "observe"
 #observe_data()
 
-adc_utils.mode = "quantize"
-if not args.eval:
-    logger.log("TRAINING QUANTIZED NETWORK")
-    CKPT_PATH = QUANT_CKPT_PATH
-    train_accuracy = run_training()
 
-test_accuracy = test(0)
-logger.log("QUANTIZED TESTING ACCURACY IS: " + str(test_accuracy))
+adc_utils.mode = "quantize"
+adc_utils.truncate = True
+if not os.path.exists(QUANT_CKPT_PATH):
+    adc_utils.range_mode = "exact"
+    adc_utils.range_start = None
+    if not args.eval:
+        logger.log("TRAINING QUANTIZED NETWORK")
+        CKPT_PATH = QUANT_CKPT_PATH
+        best_train_acc, best_test_acc = run_training()
+    logger.log("BEST QUANTIZED TESTING ACCURACY IS: " + str(best_test_acc))
+
+range_low = 7
+range_high = 22
+for range_mode in ["minimum", "exact"]:
+    print("Setting range_mode to", range_mode)
+    adc_utils.range_mode = range_mode
+    for range_start in reversed(list(range(range_low, range_high+1))):
+        try:
+            net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
+            print("Setting range_start to", range_start)
+            adc_utils.range_start = range_start
+
+            test_acc = test(0)
+            with open('results.csv', 'a') as f:
+                f.write(", ".join([range_mode, str(range_start), str(test_acc)]) + "\n")
+        except Exception as e:
+            print(e)
