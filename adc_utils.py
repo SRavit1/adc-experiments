@@ -130,19 +130,23 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
             self.input_observer.forward(input_)
 
         output = 0
-        for c_i in range(math.ceil(input_.shape[1]/partial_sum_size)):
-            input_slice = input[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
-            weight_slice = weight[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
-            if self.padding_mode != 'zeros':
-                output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                weight_slice, bias, self.stride,
-                                _pair(0), self.dilation, self.groups)
-            else:
-                output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
-                                self.padding, self.dilation, self.groups)
-            if mode == "quantize":
-                output_slice = FakeTruncate.apply(output_slice, x_s, x_zp, w_s, w_zp, range_start, output_bit)
-            output += output_slice
+        partial_sum_size = 1000
+        group_size = int(input_.shape[1]/self.groups) #weight_.shape[1]
+        for g_i in range(self.groups):
+            input_group = input_[:,g_i*group_size:(g_i+1)*group_size,:,:]
+            for c_i in range(math.ceil(input_group.shape[1]/partial_sum_size)):
+                input_slice = input_group[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+                weight_slice = weight_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+                if self.padding_mode != 'zeros':
+                    output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                                    weight_slice, bias, self.stride,
+                                    _pair(0), self.dilation, 1) #self.groups)
+                else:
+                    output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
+                                    self.padding, self.dilation, 1) #self.groups)
+                if False: #mode == "quantize":
+                    output_slice = FakeTruncate.apply(output_slice, x_s, x_zp, w_s, w_zp, range_start, output_bit)
+                output += output_slice
         
         if mode == "observe":
             self.output_observer.forward(output)
