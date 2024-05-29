@@ -7,6 +7,7 @@ from torch.nn.modules.utils import _pair
 from torch.ao.quantization.observer import MinMaxObserver, HistogramObserver
 import math
 import ast
+from multiprocessing import Pool
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -21,21 +22,23 @@ range_start=None
 mode = "quantize"
 truncate = False
 
+results = [] # output of func
+
 def get_quant_values(input, observer, bitwidth, signedness='s'):
-    """
-    alpha, beta = torch.max(input), torch.min(input)
-    s = (alpha - beta) / (2**bitwidth-1)
-    zp = -1*torch.round(beta / s)
-    min_ = 0
-    max_ = (2**bitwidth)-1
-    """
-    #"""
-    s = torch.max(torch.abs(input)) / (2**bitwidth - 1)
-    zp = 0
-    min_ = -2**(bitwidth-1)
-    max_ = 2**(bitwidth-1)-1
-    #"""
+    mode = "symmetric"
+    if mode == "asymmetric":
+        alpha, beta = torch.max(input), torch.min(input)
+        s = (alpha - beta) / (2**bitwidth-1)
+        zp = -1*torch.round(beta / s)
+        min_ = 0
+        max_ = (2**bitwidth)-1
+    elif mode == "symmetric":
+        s = 3 * torch.max(torch.abs(input)) / (2**bitwidth - 1)
+        zp = 0
+        min_ = -2**(bitwidth-1)
+        max_ = 2**(bitwidth-1)-1
     return s, zp, min_, max_
+
     if observer is not None:
         min_, max_ = observer.quant_min, observer.quant_max
         s, zp = observer.calculate_qparams()
@@ -114,28 +117,31 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         self.output_observer = ObserverCls(quant_min=-2**(output_bit-1), quant_max=2**(output_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint32).to(device)
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
+        global mode
         input_, weight_ = input, weight
         
-        global mode
+        x_s, x_zp, w_s, w_zp = 1, 0, 1, 0
         if mode == "quantize":
-            if not self.observers_initialized:
-                self.initialize_observers() 
-            x_s, x_zp, w_s, w_zp = 1, 0, 1, 0
-            input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, input_bit)
-            weight_.data, w_s, w_zp = FakeQuantize.apply(self.weight_org, None, weight_bit)
+            pass
+            #if not self.observers_initialized:
+            #    self.initialize_observers() 
+            #input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, input_bit)
+            #weight_.data, w_s, w_zp = FakeQuantize.apply(self.weight_org, None, weight_bit)
+            input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, None, input_bit)
+            weight_.data, w_s, w_zp = FakeQuantize.apply(weight_.data, None, weight_bit)
 
         if mode == "observe":
             if not self.observers_initialized:
                 self.initialize_observers() 
             self.input_observer.forward(input_)
 
-        output = 0
-        partial_sum_size = 1000
-        group_size = int(input_.shape[1]/self.groups) #weight_.shape[1]
-        for g_i in range(self.groups):
-            input_group = input_[:,g_i*group_size:(g_i+1)*group_size,:,:]
-            for c_i in range(math.ceil(input_group.shape[1]/partial_sum_size)):
-                input_slice = input_group[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+
+        if True: #mode == "quantize":
+            output = 0
+            weight_ = torch.clone(weight_.data)
+            weight_ = torch.tile(weight_, (1, int(input_.shape[1]/weight_.shape[1]), 1, 1))
+            for c_i in range(math.ceil(input_.shape[1]/partial_sum_size)):
+                input_slice = input_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
                 weight_slice = weight_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
                 if self.padding_mode != 'zeros':
                     output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
@@ -144,10 +150,18 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
                 else:
                     output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
                                     self.padding, self.dilation, 1) #self.groups)
-                if False: #mode == "quantize":
+                if mode == "quantize":
                     output_slice = FakeTruncate.apply(output_slice, x_s, x_zp, w_s, w_zp, range_start, output_bit)
                 output += output_slice
-        
+        else:
+            if self.padding_mode != 'zeros':
+                output = F.conv2d(F.pad(input_, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                          weight_, bias, self.stride,
+                          _pair(0), self.dilation, self.groups)
+            else:
+                output = F.conv2d(input_, weight_, bias, self.stride,
+                    self.padding, self.dilation, self.groups)
+
         if mode == "observe":
             self.output_observer.forward(output)
         

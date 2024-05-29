@@ -27,8 +27,8 @@ args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
 
-net_name = 'MobileNetV2'
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+net_name = 'ResNet18' #'MobileNetV2'
+device = 'cpu' #'cuda' if torch.cuda.is_available() else 'cpu'
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 n_epochs = args.train_epochs
 
@@ -165,7 +165,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
 if os.path.exists(FLOAT_CKPT_PATH):
     logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
-    net.load_state_dict(torch.load(FLOAT_CKPT_PATH))
+    net.load_state_dict(torch.load(FLOAT_CKPT_PATH), strict=False)
 else:
     logger.log("PRETRAINING FLOATING NETWORK")
     CKPT_PATH = FLOAT_CKPT_PATH
@@ -193,13 +193,13 @@ if not os.path.exists(QUANT_CKPT_PATH):
     logger.log("BEST QUANTIZED TESTING ACCURACY IS: " + str(best_test_acc))
 
 range_low = 7
-range_high = 22
+range_high = 15
 for range_mode in ["minimum", "exact"]:
     print("Setting range_mode to", range_mode)
     adc_utils.range_mode = range_mode
     for range_start in reversed(list(range(range_low, range_high+1))):
         try:
-            net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
+            net.load_state_dict(torch.load(FLOAT_CKPT_PATH), strict=False)
             print("Setting range_start to", range_start)
             adc_utils.range_start = range_start
 
