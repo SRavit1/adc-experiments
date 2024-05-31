@@ -33,10 +33,11 @@ def get_quant_values(input, observer, bitwidth, signedness='s'):
         min_ = 0
         max_ = (2**bitwidth)-1
     elif mode == "symmetric":
-        s = 3 * torch.max(torch.abs(input)) / (2**bitwidth - 1)
+        s = torch.max(torch.abs(input)) / (2**bitwidth - 1)
         zp = 0
         min_ = -2**(bitwidth-1)
         max_ = 2**(bitwidth-1)-1
+    s = 0.03
     return s, zp, min_, max_
 
     if observer is not None:
@@ -122,7 +123,6 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         
         x_s, x_zp, w_s, w_zp = 1, 0, 1, 0
         if mode == "quantize":
-            pass
             #if not self.observers_initialized:
             #    self.initialize_observers() 
             #input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, input_bit)
@@ -137,22 +137,31 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
 
 
         if True: #mode == "quantize":
-            output = 0
-            weight_ = torch.clone(weight_.data)
-            weight_ = torch.tile(weight_, (1, int(input_.shape[1]/weight_.shape[1]), 1, 1))
-            for c_i in range(math.ceil(input_.shape[1]/partial_sum_size)):
-                input_slice = input_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
-                weight_slice = weight_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+            if self.groups == 1: # Standard convolution
+                output = 0
+                for c_i in range(math.ceil(input_.shape[1]/partial_sum_size)):
+                    input_slice = input_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+                    weight_slice = weight_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+                    if self.padding_mode != 'zeros':
+                        output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                                        weight_slice, bias, self.stride,
+                                        _pair(0), self.dilation, 1) #self.groups)
+                    else:
+                        output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
+                                        self.padding, self.dilation, 1) #self.groups)
+                    if mode == "quantize" and truncate:
+                        output_slice = FakeTruncate.apply(output_slice, x_s, x_zp, w_s, w_zp, range_start, output_bit)
+                    output += output_slice
+            else: # Depthwise convolution
                 if self.padding_mode != 'zeros':
-                    output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                    weight_slice, bias, self.stride,
-                                    _pair(0), self.dilation, 1) #self.groups)
+                    output = F.conv2d(F.pad(input_, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                              weight_, bias, self.stride,
+                              _pair(0), self.dilation, self.groups)
                 else:
-                    output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
-                                    self.padding, self.dilation, 1) #self.groups)
-                if mode == "quantize":
-                    output_slice = FakeTruncate.apply(output_slice, x_s, x_zp, w_s, w_zp, range_start, output_bit)
-                output += output_slice
+                    output = F.conv2d(input_, weight_, bias, self.stride,
+                        self.padding, self.dilation, self.groups)
+                if mode == "quantize" and truncate:
+                     output = FakeTruncate.apply(output, x_s, x_zp, w_s, w_zp, range_start, output_bit)
         else:
             if self.padding_mode != 'zeros':
                 output = F.conv2d(F.pad(input_, self._reversed_padding_repeated_twice, mode=self.padding_mode),

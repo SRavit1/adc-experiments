@@ -27,7 +27,8 @@ args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
 
-net_name = 'ResNet18' #'MobileNetV2'
+#net_name = 'MobileNetV2'
+net_name = 'ResNet18'
 device = 'cpu' #'cuda' if torch.cuda.is_available() else 'cpu'
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 n_epochs = args.train_epochs
@@ -128,6 +129,10 @@ def test(epoch):
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
+            if adc_utils.mode=="quantize":
+                for p in net.modules():
+                    if isinstance(p, nn.Conv2d):
+                        p.weight.data.copy_(p.weight_org)
             outputs = net(inputs)
             loss = criterion(outputs, targets)
 
@@ -169,8 +174,8 @@ if os.path.exists(FLOAT_CKPT_PATH):
 else:
     logger.log("PRETRAINING FLOATING NETWORK")
     CKPT_PATH = FLOAT_CKPT_PATH
-    adc_utils.mode = "float"
-    train_accuracy, test_accuracy = run_training()
+    #adc_utils.mode = "float"
+    #train_accuracy, test_accuracy = run_training()
 
 adc_utils.mode = "float"
 test_accuracy = test(0)
@@ -180,9 +185,10 @@ logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
 #adc_utils.mode = "observe"
 #observe_data()
 
-
 adc_utils.mode = "quantize"
-adc_utils.truncate = True
+adc_utils.truncate = False
+if os.path.exists(QUANT_CKPT_PATH):
+    net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
 if not os.path.exists(QUANT_CKPT_PATH):
     adc_utils.range_mode = "exact"
     adc_utils.range_start = None
@@ -192,14 +198,15 @@ if not os.path.exists(QUANT_CKPT_PATH):
         best_train_acc, best_test_acc = run_training()
     logger.log("BEST QUANTIZED TESTING ACCURACY IS: " + str(best_test_acc))
 
+adc_utils.truncate = True
 range_low = 7
-range_high = 15
+range_high = 21
 for range_mode in ["minimum", "exact"]:
     print("Setting range_mode to", range_mode)
     adc_utils.range_mode = range_mode
     for range_start in reversed(list(range(range_low, range_high+1))):
         try:
-            net.load_state_dict(torch.load(FLOAT_CKPT_PATH), strict=False)
+            net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
             print("Setting range_start to", range_start)
             adc_utils.range_start = range_start
 
