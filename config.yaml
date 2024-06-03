@@ -1,0 +1,17 @@
+# Training Hyperparameters
+batch_size: 32
+train_epochs: 30
+lr: 0.1
+log_dir: "./log.txt"
+net_name: "ResNet18" #MobileNetV2
+qat: False
+mode: "quantize"
+# HW Parameters
+act_bit: 8
+weight_bit: 8
+partial_sum_size: 256
+range_start: 14
+range_mode: "per_layer"
+cim_type: "bit-parallel" #4-4, 3-3-2, bit-serial #NOT IMPLEMENTED
+signed_weight_approach: "unipolar" #differential_pair #NOT IMPLEMENTED
+fp_coprocessor: True #False case NOT IMPLEMENTED
