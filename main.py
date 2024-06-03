@@ -13,13 +13,8 @@ import logger
 import cim_utils
 import yaml
 from pathlib import Path
-<<<<<<< HEAD
 from load_config import load_config
 
-=======
-
-from load_config import load_config
->>>>>>> 4804df1d4a036e731a53d504c9a70f183f45319a
 args = load_config()
 
 torch.autograd.set_detect_anomaly(True)
@@ -163,11 +158,6 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
-<<<<<<< HEAD
-=======
-# ---
-
->>>>>>> 4804df1d4a036e731a53d504c9a70f183f45319a
 cim_utils.mode = "float"
 if os.path.exists(FLOAT_CKPT_PATH):
     logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
@@ -179,14 +169,8 @@ else:
 
 test_accuracy = test(0)
 logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
-<<<<<<< HEAD
 
 # TODO: Uncomment when Pytorch observers implemented
-=======
-
-# ---
-
->>>>>>> 4804df1d4a036e731a53d504c9a70f183f45319a
 """
 # Observe in 2 passes- one for mean, one for var
 logger.log("OBSERVING DATA")

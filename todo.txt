@@ -1,3 +1,4 @@
+- Make all inputs positive
 - Implement 2-pass approach
 - Use Pytorch scales/zero-points
 - Profiling of layer-by-layer distribution

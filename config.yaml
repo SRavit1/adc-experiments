@@ -13,5 +13,5 @@ partial_sum_size: 256
 range_start: 14
 range_mode: "per_layer"
 cim_type: "bit-parallel" #4-4, 3-3-2, bit-serial #NOT IMPLEMENTED
-signed_weight_approach: "unipolar" #differential_pair #NOT IMPLEMENTED
+signed_weight_approach: "unipolar" #unipolar, differential_pair #NOT IMPLEMENTED
 fp_coprocessor: True #False case NOT IMPLEMENTED
