@@ -10,23 +10,15 @@ import argparse
 from models import *
 from utils import progress_bar
 import logger
-import adc_utils
+import cim_utils
+import yaml
+from pathlib import Path
+
+from load_config import load_config
+args = load_config()
 
 torch.autograd.set_detect_anomaly(True)
 quantize_mode=False
-
-parser = argparse.ArgumentParser(description='Process some integers.')
-parser.add_argument('--batch_size', default=32, help='Batch size.')
-parser.add_argument('--train_epochs', default=30, help='number of epochs')
-parser.add_argument('--log_dir', default="./log.txt", help='path to save log in')
-parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
-#--- custom args ---
-parser.add_argument('--float', action='store_true', help='do not quantize model')
-parser.add_argument('--net_name', default='MobileNetV2', help='default network name') #'ResNet18'
-parser.add_argument('--observe', action='store_true', help='observe input activations')
-parser.add_argument('--qat', action='store_true', help='perform qat')
-args = parser.parse_args()
 
 logger = logger.Logger(args.log_dir)
 
@@ -101,12 +93,12 @@ def train(epoch):
         outputs = net(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
-        if adc_utils.mode=="quantize":
+        if cim_utils.mode=="quantize":
             for p in net.modules():
                 if isinstance(p, nn.Conv2d):
                     p.weight.data.copy_(p.weight_org)
         optimizer.step()
-        if adc_utils.mode=="quantize":
+        if cim_utils.mode=="quantize":
             for p in net.modules():
                 if isinstance(p, nn.Conv2d):
                     p.weight_org.data.copy_(p.weight.data)
@@ -129,7 +121,7 @@ def test(epoch):
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
-            if adc_utils.mode=="quantize":
+            if cim_utils.mode=="quantize":
                 for p in net.modules():
                     if isinstance(p, nn.Conv2d):
                         p.weight.data.copy_(p.weight_org)
@@ -172,7 +164,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
 # ---
 
-adc_utils.mode = "float"
+cim_utils.mode = "float"
 if os.path.exists(FLOAT_CKPT_PATH):
     logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
     net.load_state_dict(torch.load(FLOAT_CKPT_PATH), strict=False)
@@ -181,30 +173,30 @@ else:
     CKPT_PATH = FLOAT_CKPT_PATH
     train_accuracy, test_accuracy = run_training()
 
-if args.float:
-    test_accuracy = test(0)
-    logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
-    exit(0)
+test_accuracy = test(0)
+logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
 
 # ---
 
+"""
 # Observe in 2 passes- one for mean, one for var
 logger.log("OBSERVING DATA")
-adc_utils.mode = "observe"
-adc_utils.truncate_observe_mode = "mean"
+cim_utils.mode = "observe"
+cim_utils.truncate_observe_mode = "mean"
 observe_data()
-adc_utils.truncate_observe_mode = "var"
+cim_utils.truncate_observe_mode = "var"
 observe_data()
+"""
 
 # ---
 
 logger.log("RUNNING QUANTIZED TRAINING")
-adc_utils.mode = "quantize"
+cim_utils.mode = "quantize"
 if os.path.exists(QUANT_CKPT_PATH):
     net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
 else:
-    adc_utils.range_mode = "exact"
-    adc_utils.range_start = None
+    cim_utils.range_mode = "exact"
+    cim_utils.range_start = None
     if not args.eval:
         logger.log("TRAINING QUANTIZED NETWORK")
         CKPT_PATH = QUANT_CKPT_PATH
@@ -213,16 +205,16 @@ else:
 
 range_low = 7
 range_high = 21
-for range_mode in ["minimum", "exact"]:
+for range_mode in ["per_layer", "per_model"]:
     logger.log("SETTING RANGE MODE TO " + str(range_mode))
-    adc_utils.range_mode = range_mode
-    for range_start in reversed(list(range(range_low, range_high+1))):
+    cim_utils.range_mode = range_mode
+    for range_start in list(range(range_low, range_high+1)):
         if args.qat:
             CKPT_PATH = QUANT_CKPT_PATH
             best_train_acc, best_test_acc = run_training()
 
         net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
-        adc_utils.range_start = range_start
+        cim_utils.range_start = range_start
         test_acc = test(0)
 
         logger.log("ACCURACY FOR range_start " + str(range_start) + " IS " + str(test_acc))
@@ -230,5 +222,5 @@ for range_mode in ["minimum", "exact"]:
             f.write(", ".join([range_mode, str(range_start), str(test_acc)]) + "\n")
 
 """
-- Implement "minimum" in adc_utils.py by first doing profiling
+- Implement "minimum" in cim_utils.py by first doing profiling
 """

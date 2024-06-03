@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 
-from adc_utils import ADC_Conv2d
+from cim_utils import ADC_Conv2d
 
 Conv2dClass = ADC_Conv2d
 

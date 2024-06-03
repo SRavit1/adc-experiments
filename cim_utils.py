@@ -5,25 +5,21 @@ from torch.nn import functional as F
 import torch.ao.quantization.observer as observer
 from torch.nn.modules.utils import _pair
 from torch.ao.quantization.observer import MinMaxObserver, HistogramObserver
+import numpy as np
 import math
 import ast
 from multiprocessing import Pool
+import yaml
+
+from load_config import load_config
+args = load_config()
+
+range_start = args.range_start # May be modified by main.py
+range_mode = args.range_mode
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 ObserverCls = MinMaxObserver #HistogramObserver
-
-partial_sum_size=256
-input_bit=8
-weight_bit=6
-output_bit=8
-range_mode="minimum"
-range_start=None
-mode = "quantize"
-truncate_observe_mode = "mean" #"var"
-truncate = True
-
-results = [] # output of func
 
 class AverageMeter(object):
     def __init__(self):
@@ -42,6 +38,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 def get_quant_values(input, observer, bitwidth):
+    observer = None
     if observer is not None:
         min_, max_ = observer.quant_min, observer.quant_max
         s, zp = observer.calculate_qparams()
@@ -112,18 +109,17 @@ class FakeTruncate(torch.autograd.Function):
         y_q = y / (x_s * w_s)
 
         global truncate
-        if truncate:
-            range_start_temp = range_start
-            if range_start is None:
-                range_start = output_bit - 1
-            if range_mode=="minimum":
-                range_start = torch.ceil(torch.log(torch.Tensor([y_mean]))/torch.log(torch.Tensor([2.]))).to(y_q.device)
-            if range_start_temp is not None:
-                range_start = np.clip(range_start, range_start_temp, range_start_temp+4)
+        range_start_temp = range_start
+        if range_start is None:
+            range_start = output_bit - 1
+        if args.range_mode=="per_layer":
+            range_start = torch.ceil(torch.log(torch.Tensor([y_mean]))/torch.log(torch.Tensor([2.]))).to(y_q.device)
+        if range_start_temp is not None:
+            range_start = np.clip(range_start, range_start_temp, range_start_temp+4)
 
-            abs_clamp_min = 2**(range_start-1-(bitwidth-1))
-            abs_clamp_max = 2**(range_start-1)-1
-            y_q = torch.sign(y_q) * torch.clamp(torch.abs(y_q), abs_clamp_min, abs_clamp_max)
+        abs_clamp_min = 2**(range_start-(bitwidth-1))
+        abs_clamp_max = 2**(range_start)-1
+        y_q = torch.sign(y_q) * torch.clamp(torch.abs(y_q), abs_clamp_min, abs_clamp_max)
 
         # Dequantize
         y_fq = y_q * (x_s * w_s)
@@ -149,8 +145,8 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
        
     def initialize_observers(self):
         self.observers_initialized = True
-        self.input_observer = ObserverCls(quant_min=-2**(input_bit-1), quant_max=2**(input_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint32).to(device)
-        self.truncate_input_observer = ObserverCls(quant_min=-2**(input_bit-1), quant_max=2**(input_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint32).to(device)
+        self.input_observer = ObserverCls(quant_min=-2**(args.act_bit-1), quant_max=2**(args.act_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint32).to(device)
+        self.truncate_input_observer = ObserverCls(quant_min=-2**(args.act_bit-1), quant_max=2**(args.act_bit-1)-1, qscheme=torch.per_tensor_symmetric, dtype=torch.qint32).to(device)
         
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         global mode
@@ -163,14 +159,14 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
             self.input_observer.forward(input_)
 
         if mode == "observe" or mode == "quantize":
-            input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, input_bit)
-            weight_.data, w_s, w_zp = FakeQuantize.apply(weight_.data, None, weight_bit) #self.weight_org
+            input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, args.act_bit)
+            weight_.data, w_s, w_zp = FakeQuantize.apply(weight_.data, None, args.weight_bit) #self.weight_org
 
             if self.groups == 1: # Standard convolution
                 output = 0
-                for c_i in range(math.ceil(input_.shape[1]/partial_sum_size)):
-                    input_slice = input_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
-                    weight_slice = weight_[:,c_i*partial_sum_size:(c_i+1)*partial_sum_size,:,:]
+                for c_i in range(math.ceil(input_.shape[1]/args.partial_sum_size)):
+                    input_slice = input_[:,c_i*args.partial_sum_size:(c_i+1)*args.partial_sum_size,:,:]
+                    weight_slice = weight_[:,c_i*args.partial_sum_size:(c_i+1)*args.partial_sum_size,:,:]
                     if self.padding_mode != 'zeros':
                         output_slice = F.conv2d(F.pad(input_slice, self._reversed_padding_repeated_twice, mode=self.padding_mode),
                                         weight_slice, bias, self.stride,
@@ -178,15 +174,14 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
                     else:
                         output_slice = F.conv2d(input_slice, weight_slice, bias, self.stride,
                                         self.padding, self.dilation, 1) #self.groups)
-                    if truncate:
-                        if mode == "observe":
-                            self.truncate_input_observer.forward(output_slice)
-                            if truncate_observe_mode == "mean":
-                                self.truncate_input_mean_avg_meter.update(float(torch.mean(output_slice)))
-                            elif truncate_observe_mode == "var":
-                                self.truncate_input_var_avg_meter.update((float(torch.mean(output_slice))-self.truncate_input_mean_avg_meter.avg)**2)
-                        output_slice_mean = self.truncate_input_mean_avg_meter.avg if self.truncate_input_mean_avg_meter is not None else None
-                        output_slice = FakeTruncate.apply(output_slice, output_slice_mean, x_s, x_zp, w_s, w_zp, range_start, output_bit)
+                    if mode == "observe":
+                        self.truncate_input_observer.forward(output_slice)
+                        if truncate_observe_mode == "mean":
+                            self.truncate_input_mean_avg_meter.update(float(torch.mean(output_slice)))
+                        elif truncate_observe_mode == "var":
+                            self.truncate_input_var_avg_meter.update((float(torch.mean(output_slice))-self.truncate_input_mean_avg_meter.avg)**2)
+                    output_slice_mean = self.truncate_input_mean_avg_meter.avg if self.truncate_input_mean_avg_meter is not None else None
+                    output_slice = FakeTruncate.apply(output_slice, output_slice_mean, x_s, x_zp, w_s, w_zp, range_start, args.act_bit)
                     output += output_slice
             else: # Depthwise convolution (assuming group_size < 128)
                 if self.padding_mode != 'zeros':
@@ -196,11 +191,11 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
                 else:
                     output = F.conv2d(input_, weight_, bias, self.stride,
                         self.padding, self.dilation, self.groups)
-                if truncate:
-                    if mode == "observe":
-                        self.truncate_input_observer.forward(output)
-                    output_mean = self.truncate_input_mean_avg_meter.avg if self.truncate_input_mean_avg_meter is not None else None
-                    output = FakeTruncate.apply(output, output_mean, x_s, x_zp, w_s, w_zp, range_start, output_bit)
+                if mode == "observe":
+                    self.truncate_input_observer.forward(output)
+                output_mean = self.truncate_input_mean_avg_meter.avg if self.truncate_input_mean_avg_meter is not None else None
+                print(range_start)
+                output = FakeTruncate.apply(output, output_mean, x_s, x_zp, w_s, w_zp, range_start, args.act_bit)
         else:
             if self.padding_mode != 'zeros':
                 output = F.conv2d(F.pad(input_, self._reversed_padding_repeated_twice, mode=self.padding_mode),

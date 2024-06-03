@@ -4,5 +4,5 @@ class Logger:
     
     def log(self, s):
         print(s)
-        with open(self.file, 'a') as f:
-            f.write(s + "\n")
+        #with open(self.file, 'a') as f:
+        #    f.write(s + "\n")

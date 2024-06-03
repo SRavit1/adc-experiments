@@ -1,0 +1,15 @@
+batch_size: 33
+train_epochs: 30
+log_dir: "./log.txt"
+qat: False
+lr: 0.1
+net_name: "ResNet18" #MobileNetV2
+act_bit: 8
+weight_bit: 8
+partial_sum_size: 256
+range_start: 15
+range_mode: "per_layer"
+cim_type: "bit-parallel" #4-4, 3-3-2, bit-serial #NOT IMPLEMENTED
+signed_weight_approach: "unipolar" #differential_pair #NOT IMPLEMENTED
+range_mode: "minimum"
+mode: "quantize"
