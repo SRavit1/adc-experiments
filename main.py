@@ -91,12 +91,12 @@ def train(epoch):
         outputs = net(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
-        if cim_utils.mode=="quantize":
+        if cim_utils.conv_mode=="quantize":
             for p in net.modules():
                 if isinstance(p, nn.Conv2d):
                     p.weight.data.copy_(p.weight_org)
         optimizer.step()
-        if cim_utils.mode=="quantize":
+        if cim_utils.conv_mode=="quantize":
             for p in net.modules():
                 if isinstance(p, nn.Conv2d):
                     p.weight_org.data.copy_(p.weight.data)
@@ -119,7 +119,7 @@ def test(epoch):
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
-            if cim_utils.mode=="quantize":
+            if cim_utils.conv_mode=="quantize":
                 for p in net.modules():
                     if isinstance(p, nn.Conv2d):
                         p.weight.data.copy_(p.weight_org)
@@ -158,7 +158,7 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
-cim_utils.mode = "float"
+cim_utils.conv_mode = "float"
 if os.path.exists(FLOAT_CKPT_PATH):
     logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
     net.load_state_dict(torch.load(FLOAT_CKPT_PATH), strict=False)
@@ -170,28 +170,35 @@ else:
 test_accuracy = test(0)
 logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
 
+# Fuse batchnorm
+for p in net.modules():
+    if isinstance(p, cim_utils.ADC_Conv2d):
+        p.fuse_batchnorm()
+
+test_accuracy = test(0)
+logger.log("FUSED BN FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
+
 # TODO: Uncomment when Pytorch observers implemented
 """
 # Observe in 2 passes- one for mean, one for var
 logger.log("OBSERVING DATA")
-cim_utils.mode = "observe"
+cim_utils.conv_mode = "observe"
 cim_utils.truncate_observe_mode = "mean"
 observe_data()
 cim_utils.truncate_observe_mode = "var"
 observe_data()
 """
 
-cim_utils.mode = "quantize"
+cim_utils.conv_mode = "quantize"
 if os.path.exists(QUANT_CKPT_PATH):
     logger.log("LOADING PRETRAINED QUANTIZED NETWORK")
     net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
 else:
     cim_utils.range_mode = "exact"
     cim_utils.range_start = None
-    if not args.eval:
-        logger.log("TRAINING QUANTIZED NETWORK")
-        CKPT_PATH = QUANT_CKPT_PATH
-        best_train_acc, best_test_acc = run_training()
+    logger.log("TRAINING QUANTIZED NETWORK")
+    CKPT_PATH = QUANT_CKPT_PATH
+    best_train_acc, best_test_acc = run_training()
     logger.log("BEST QUANTIZED TESTING ACCURACY IS: " + str(best_test_acc))
 
 if args.qat:

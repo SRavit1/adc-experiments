@@ -24,6 +24,7 @@ class Block(nn.Module):
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = Conv2dClass(planes, out_planes, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn3 = nn.BatchNorm2d(out_planes)
+        self.conv3.relu = False
 
         self.shortcut = nn.Sequential()
         if stride == 1 and in_planes != out_planes:
@@ -33,9 +34,9 @@ class Block(nn.Module):
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
+        out = self.conv1(x) #F.relu(self.bn1(self.conv1(x)))
+        out = self.conv2(x) #F.relu(self.bn2(self.conv2(out)))
+        out = self.conv3(x) #self.bn3(self.conv3(out))
         out = out + self.shortcut(x) if self.stride==1 else out
         return out
 
@@ -70,9 +71,9 @@ class MobileNetV2(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.conv1(x) #F.relu(self.bn1(self.conv1(x)))
         out = self.layers(out)
-        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.conv2(x) #F.relu(self.bn2(self.conv2(out)))
         # NOTE: change pooling kernel_size 7 -> 4 for CIFAR10
         out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)

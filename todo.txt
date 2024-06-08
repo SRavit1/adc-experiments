@@ -1,5 +1,5 @@
+- per-layer mode should use mean/var, not dynamic per-batch basis
 - Make all inputs positive
-- Implement 2-pass approach
 - Use Pytorch scales/zero-points
 - Profiling of layer-by-layer distribution
 - QAT Clipping regularization parameter
