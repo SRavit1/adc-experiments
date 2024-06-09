@@ -10,17 +10,18 @@ import math
 import ast
 from multiprocessing import Pool
 import yaml
-
 from load_config import load_config
+
 args = load_config()
 
-range_start = args.range_start # May be modified by main.py
-range_mode = args.range_mode
+clamping_range_start = args.clamping_range_start # May be modified by main.py
+clamping_range_mode = args.clamping_range_mode
 conv_mode = "float"
-
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
 ObserverCls = MinMaxObserver #HistogramObserver
+clamping = False
+
+s, zp = 0.03, 0
 
 class AverageMeter(object):
     def __init__(self):
@@ -45,11 +46,11 @@ def get_quant_values_observer(input, observer, bitwidth):
         s, zp = observer.calculate_qparams()
     else:
         min_, max_ = (-2**(bitwidth-1)), (2**(bitwidth-1))-1
-        s, zp = torch.Tensor([0.03]).to(device), torch.Tensor([0.0]).to(device)
+        s, zp = torch.Tensor([s]).to(device), torch.Tensor([0.0]).to(device)
     return s, zp, min_, max_
 
 def get_quant_values_no_observer(input, bitwidth):
-    if args.quant_signedness == "asymmetric":
+    if args.quant_sign == "asymmetric":
         alpha, beta = torch.max(input), torch.min(input)
         s = (alpha - beta) / (2**bitwidth-1)
         zp = -1*torch.round(beta / s)
@@ -60,60 +61,66 @@ def get_quant_values_no_observer(input, bitwidth):
         zp = 0
         min_ = -2**(bitwidth-1)
         max_ = 2**(bitwidth-1)-1
+    return s, zp, min_, max_
 
-"""
-x- tensor to be quantized
-observer- provides s/zp/input_min/input_max
-bitwidth- bitwidth of quantization
-"""
-class FakeQuantize(torch.autograd.Function):
+class Quantize(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, observer, bitwidth):
-        s, zp, min_, max_ = get_quant_values(x, observer, bitwidth)
-        
-        # Quantize
+    def forward(ctx, x, s, zp, min, max):
+        ctx.s = s
         x = (x - zp) / s
         x = torch.round(x)
-        x = torch.clamp(x, min_, max_)
-        
-        # Dequantize
+        x = torch.clamp(x, min, max)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output/ctx.s, None, None, None, None
+
+class Dequantize(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, s, zp, min, max):
+        ctx.s = s
         x = (x * s) + zp
-        return x, s, zp
+        return x
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None
+        return grad_output*ctx.s, None, None, None, None
 
-class FakeTruncate(torch.autograd.Function):
+class FakeQuantize(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, y, y_mean, x_s, x_zp, w_s, w_zp, range_start, bitwidth):
+    def forward(ctx, x, s, zp, min, max):
+        return x
+        x = (x - zp) / s
+        x = torch.round(x)
+        x = torch.clamp(x, min, max)
+        x = (x * s) + zp
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None, None, None
+
+class FakeADC(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, y, gain, x_s, w_s, clamping_range_start, bitwidth):
+        ctx.gain = gain
+        ctx.y_sum = torch.sum(y)
+        if clamping:
+            y = y / (x_s * w_s)
+        y = y * gain
+        if clamping:
+            y = y / (2**args.clamping_range_start)
+            min, max = -(2**(bitwidth-1)), (2**(bitwidth-1))-1
+            y = torch.round(torch.clamp(y, min, max))
+            y = y * (2**args.clamping_range_start)
+        if clamping:
+            y = y * (x_s * w_s)
         return y
-        # Quantize
-        y_q = y / (x_s * w_s)
-
-        global truncate
-        range_start_temp = range_start
-        if range_start is None:
-            range_start = output_bit - 1
-        if args.range_mode=="per_layer":
-            #range_start = torch.ceil(torch.log(torch.Tensor([y_mean]))/torch.log(torch.Tensor([2.]))).cpu()
-            range_start = torch.ceil(torch.log(torch.max(torch.abs(y_q.cpu())))/torch.log(torch.Tensor([2.])))
-        if range_start_temp is not None:
-            range_start = np.clip(range_start, range_start_temp, range_start_temp+4)
-
-        abs_clamp_min = int(2**(range_start-(bitwidth-1)))
-        abs_clamp_max = int((2**(range_start)-1))
-        y_q = torch.sign(y_q) * torch.clamp(torch.abs(y_q), abs_clamp_min, abs_clamp_max)
-
-        # Dequantize
-        y_fq = y_q * (x_s * w_s)
-
-        return y_fq
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None, None, None, None, None
-
+        return grad_output*ctx.gain, grad_output*ctx.y_sum, None, None, None, None
 
 class MyBatchNorm2d(torch.nn.BatchNorm2d):
     def __init__(self, *kargs, **kwargs):
@@ -137,6 +144,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         self.truncate_input_mean_avg_meter = AverageMeter()
         self.truncate_input_var_avg_meter = AverageMeter()
 
+        self.gain = torch.Tensor([1.]).to(device) if clamping_range_mode=="per_model" else torch.nn.parameter.Parameter(torch.Tensor([1.]))
         self.bn = MyBatchNorm2d(kargs[1])
         self.relu = True
 
@@ -157,6 +165,13 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         else:
             self.bias.data += bias_add
         self.bn.deactivated = True
+        
+    def calculate_qparams(self):
+        # use self.input_observer, args.act_bit, args.weight_bit, args.quant_sign
+        self.x_s, self.x_zp = s, zp
+        self.x_min, self.x_max = -2**args.act_bit, 2**args.act_bit-1
+        self.w_s, self.w_zp = s, zp
+        self.w_min, self.w_max = -2**args.weight_bit, 2**args.weight_bit-1
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         global mode
@@ -169,12 +184,12 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
             self.input_observer.forward(input_)
 
         if conv_mode == "observe" or conv_mode == "quantize":
-            input_.data, x_s, x_zp = FakeQuantize.apply(input_.data, self.input_observer, args.act_bit)
-            weight_.data, w_s, w_zp = FakeQuantize.apply(weight_.data, None, args.weight_bit) #self.weight_org
+            input_.data = FakeQuantize.apply(input_.data, self.x_s, self.x_zp, self.x_min, self.x_max)
+            weight_.data = FakeQuantize.apply(weight_.data, self.w_s, self.w_zp, self.w_min, self.w_max)
 
-            if args.signed_weight_approach == "unipolar":
+            if args.cim_signed_type == "unipolar":
                 loops = [(input_, weight_, 1.)]
-            elif args.signed_weight_approach == "differential_pair":
+            elif args.cim_signed_type == "differential_pair":
                 loops = [(input_, torch.relu(weight_), 1.), (input_, torch.relu(-weight_), -1.)]
             else:
                 raise Exception
@@ -199,8 +214,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
                                 self.truncate_input_mean_avg_meter.update(float(torch.mean(output_slice)))
                             elif truncate_observe_mode == "var":
                                 self.truncate_input_var_avg_meter.update((float(torch.mean(output_slice))-self.truncate_input_mean_avg_meter.avg)**2)
-                        output_slice_mean = self.truncate_input_mean_avg_meter.avg if self.truncate_input_mean_avg_meter is not None else None
-                        output_slice = FakeTruncate.apply(output_slice, output_slice_mean, x_s, x_zp, w_s, w_zp, range_start, args.act_bit)
+                        output_slice = FakeADC.apply(output_slice, self.gain, self.x_s, self.w_s, args.clamping_range_start, args.act_bit)
                         output += output_slice
                 else: # Depthwise convolution (assuming group_size < 128)
                     if self.padding_mode != 'zeros':
@@ -212,8 +226,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
                             self.padding, self.dilation, self.groups)
                     if conv_mode == "observe":
                         self.truncate_input_observer.forward(output)
-                    output_mean = self.truncate_input_mean_avg_meter.avg if self.truncate_input_mean_avg_meter is not None else None
-                    output = FakeTruncate.apply(output, output_mean, x_s, x_zp, w_s, w_zp, range_start, args.act_bit)
+                    output = FakeADC.apply(output, self.gain, self.x_s, self.w_s, args.clamping_range_start, args.act_bit)
                 
                 output = output * sign
                 total_output += output

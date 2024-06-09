@@ -27,7 +27,7 @@ start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 n_epochs = args.train_epochs
 
 FLOAT_CKPT_PATH = "./" + "_".join([args.net_name, "float"]) + ".pth"
-QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "quant"]) + ".pth"
+QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "quant", args.clamping_range_mode]) + ".pth"
 CKPT_PATH = FLOAT_CKPT_PATH
 
 transform_train = transforms.Compose([
@@ -121,7 +121,7 @@ def test(epoch):
             inputs, targets = inputs.to(device), targets.to(device)
             if cim_utils.conv_mode=="quantize":
                 for p in net.modules():
-                    if isinstance(p, nn.Conv2d):
+                    if hasattr(p, "weight_org"):
                         p.weight.data.copy_(p.weight_org)
             outputs = net(inputs)
             loss = criterion(outputs, targets)
@@ -158,6 +158,7 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
+# Load & pretrain floating point network
 cim_utils.conv_mode = "float"
 if os.path.exists(FLOAT_CKPT_PATH):
     logger.log("LOADING PRETRAINED FLOAT WEIGHTS")
@@ -167,16 +168,9 @@ else:
     CKPT_PATH = FLOAT_CKPT_PATH
     train_accuracy, test_accuracy = run_training()
 
+# Test floating point network
 test_accuracy = test(0)
 logger.log("FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
-
-# Fuse batchnorm
-for p in net.modules():
-    if isinstance(p, cim_utils.ADC_Conv2d):
-        p.fuse_batchnorm()
-
-test_accuracy = test(0)
-logger.log("FUSED BN FLOAT TESTING ACCURACY IS: " + str(test_accuracy))
 
 # TODO: Uncomment when Pytorch observers implemented
 """
@@ -189,24 +183,43 @@ cim_utils.truncate_observe_mode = "var"
 observe_data()
 """
 
+# Calculate quantization parameters
+for p in net.modules():
+    if isinstance(p, cim_utils.ADC_Conv2d):
+        p.calculate_qparams()
+
+# Fuse batchnorm
+if args.fuse_bn:
+    for p in net.modules():
+        if isinstance(p, cim_utils.ADC_Conv2d):
+            p.fuse_batchnorm()
+
+    # Test fused-bn floating point network
+    test_accuracy = test(0)
+    logger.log("FUSED BN TESTING ACCURACY IS: " + str(test_accuracy))
+
+# Load pretrained quantized network if it exists
 cim_utils.conv_mode = "quantize"
 if os.path.exists(QUANT_CKPT_PATH):
     logger.log("LOADING PRETRAINED QUANTIZED NETWORK")
     net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
-else:
-    cim_utils.range_mode = "exact"
-    cim_utils.range_start = None
+
+# Train quantized network
+cim_utils.clamping = False
+if not os.path.exists(QUANT_CKPT_PATH) or args.perform_qat:
     logger.log("TRAINING QUANTIZED NETWORK")
     CKPT_PATH = QUANT_CKPT_PATH
     best_train_acc, best_test_acc = run_training()
     logger.log("BEST QUANTIZED TESTING ACCURACY IS: " + str(best_test_acc))
 
-if args.qat:
-    CKPT_PATH = QUANT_CKPT_PATH
-    best_train_acc, best_test_acc = run_training()
-else:
-    net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
+# Test quantized network without clamping
+cim_utils.clamping = False
+#net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
 test_acc = test(0)
+logger.log("BEST QUANTIZED TESTING ACCURACY (No clamping) IS: " + str(test_acc))
 
-with open('results.csv', 'a') as f:
-    f.write(", ".join([args.net_name, args.signed_weight_approach, args.range_mode, str(args.range_start), str(test_acc)]) + "\n")
+# Test quantized network with clamping
+cim_utils.clamping = True
+#net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
+test_acc = test(0)
+logger.log("BEST QUANTIZED TESTING ACCURACY (Clamping) IS: " + str(test_acc))
