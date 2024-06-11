@@ -176,7 +176,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
         global mode
         global truncate
-        input_, weight_ = input, weight
+        input_, weight_, bias_ = input, weight, bias
 
         if conv_mode == "observe":
             if not self.observers_initialized:
@@ -186,6 +186,7 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
         if conv_mode == "observe" or conv_mode == "quantize":
             input_.data = FakeQuantize.apply(input_.data, self.x_s, self.x_zp, self.x_min, self.x_max)
             weight_.data = FakeQuantize.apply(weight_.data, self.w_s, self.w_zp, self.w_min, self.w_max)
+            bias_.data = FakeQuantize.apply(bias_.data, self.w_s, self.w_zp, self.w_min, self.w_max)
 
             if args.cim_signed_type == "unipolar":
                 loops = [(input_, weight_, 1.)]

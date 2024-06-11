@@ -10,7 +10,7 @@ quant_sign: "symmetric"
 fuse_bn: True
 # HW Parameters
 act_bit: 8
-weight_bit: 8
+weight_bit: 6
 partial_sum_size: 256
 clamping_range_start: 2
 clamping_range_mode: "per_layer" #per_layer, per_model
