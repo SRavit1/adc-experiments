@@ -20,10 +20,15 @@ class Block(nn.Module):
         planes = expansion * in_planes
         self.conv1 = Conv2dClass(in_planes, planes, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
+        self.conv1.bn = self.bn1
+        self.conv1.relu = True
         self.conv2 = Conv2dClass(planes, planes, kernel_size=3, stride=stride, padding=1, groups=planes, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2.bn = self.bn2
+        self.conv2.relu = True
         self.conv3 = Conv2dClass(planes, out_planes, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn3 = nn.BatchNorm2d(out_planes)
+        self.conv3.bn = self.bn3
         self.conv3.relu = False
 
         self.shortcut = nn.Sequential()
@@ -35,8 +40,8 @@ class Block(nn.Module):
 
     def forward(self, x):
         out = self.conv1(x) #F.relu(self.bn1(self.conv1(x)))
-        out = self.conv2(x) #F.relu(self.bn2(self.conv2(out)))
-        out = self.conv3(x) #self.bn3(self.conv3(out))
+        out = self.conv2(out) #F.relu(self.bn2(self.conv2(out)))
+        out = self.conv3(out) #self.bn3(self.conv3(out))
         out = out + self.shortcut(x) if self.stride==1 else out
         return out
 
@@ -56,9 +61,13 @@ class MobileNetV2(nn.Module):
         # NOTE: change conv1 stride 2 -> 1 for CIFAR10
         self.conv1 = Conv2dClass(3, 32, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
+        self.conv1.bn = self.bn1
+        self.conv1.relu = True
         self.layers = self._make_layers(in_planes=32)
         self.conv2 = Conv2dClass(320, 1280, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn2 = nn.BatchNorm2d(1280)
+        self.conv2.bn = self.bn2
+        self.conv2.relu = True
         self.linear = nn.Linear(1280, num_classes)
 
     def _make_layers(self, in_planes):
@@ -73,7 +82,7 @@ class MobileNetV2(nn.Module):
     def forward(self, x):
         out = self.conv1(x) #F.relu(self.bn1(self.conv1(x)))
         out = self.layers(out)
-        out = self.conv2(x) #F.relu(self.bn2(self.conv2(out)))
+        out = self.conv2(out) #F.relu(self.bn2(self.conv2(out)))
         # NOTE: change pooling kernel_size 7 -> 4 for CIFAR10
         out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)

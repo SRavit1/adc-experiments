@@ -149,11 +149,11 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
             else:
                 output = F.conv2d(input_, weight_, bias, self.stride,
                     self.padding, self.dilation, self.groups)
-        
-        output = self.bn(output)
-        if self.relu:
-            output = torch.nn.functional.relu(output)
         return output
 
     def forward(self, input: Tensor) -> Tensor:
-        return self._conv_forward(input, self.weight, self.bias)
+        out = self._conv_forward(input, self.weight, self.bias)
+        out = self.bn(out)
+        if self.relu:
+            out = torch.nn.functional.relu(out)
+        return out
