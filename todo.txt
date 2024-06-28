@@ -1,8 +1,0 @@
-- per-layer mode should use mean/var, not dynamic per-batch basis
-- Make all inputs positive
-- Use Pytorch scales/zero-points
-- Profiling of layer-by-layer distribution
-- QAT Clipping regularization parameter
-- make README
-- Use torch.fx to substitute nn.Conv2d with ADC_Conv2d
-- Implement bit-serial, 4-4, 3-3-2, eventually arbitrary phase features
