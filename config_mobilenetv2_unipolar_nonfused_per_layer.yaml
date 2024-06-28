@@ -1,0 +1,18 @@
+# Training Hyperparameters
+batch_size: 32
+float_train_epochs: 100
+quant_train_epochs: 50
+lr: 0.1
+log_dir: "./log.txt"
+net_name: "MobileNetV2" #ResNet18, MobileNetV2
+conv_mode: "quantize"
+quant_sign: "symmetric"
+fuse_bn: False
+# HW Parameters
+act_bit: 8
+weight_bit: 6
+partial_sum_size: 256
+clamping_range_start: 10
+clamping_range_mode: "per_layer" #per_layer, per_model
+cim_signed_type: "unipolar" #unipolar, differential_pair
+cim_input_type: "bit-parallel" #bit-parallel, 4-4, 3-3-2, bit-serial #NOT IMPLEMENTED
