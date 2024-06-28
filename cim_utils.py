@@ -10,15 +10,24 @@ from multiprocessing import Pool
 import yaml
 from load_config import load_config
 
-args = load_config()
+args = None
+conv_mode = None
+clamping_range_start = None
+clamping_range_mode = None
+clamping = None
+device = None
+s = None
+zp = None
 
-conv_mode = "float"
-clamping_range_start = args.clamping_range_start
-clamping_range_mode = args.clamping_range_mode
-clamping = False
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-s, zp = 0.03, 0
+def initialize_params(config_path):
+    global args, conv_mode, clamping_range_start, clamping_range_mode, clamping, device, s, zp
+    args = load_config(config_path)
+    conv_mode = "float"
+    clamping_range_start = args.clamping_range_start
+    clamping_range_mode = args.clamping_range_mode
+    clamping = False
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    s, zp = 0.03, 0
 
 class FakeQuantize(torch.autograd.Function):
     @staticmethod
@@ -60,6 +69,7 @@ class MyBatchNorm2d(torch.nn.BatchNorm2d):
     
     def forward(self, input):
         if not self.deactivated:
+            print("BATCHNORM FORWARD")
             return super().forward(input)
         else:
             return input
@@ -82,6 +92,9 @@ class ADC_Conv2d(torch.nn.modules.Conv2d):
             self.bias = torch.nn.parameter.Parameter(bias_add)
         else:
             self.bias.data += bias_add
+        self.bn.deactivated = True
+    
+    def disable_batchnorm(self):
         self.bn.deactivated = True
         
     def calculate_qparams(self):

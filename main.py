@@ -14,8 +14,11 @@ import cim_utils
 import yaml
 from pathlib import Path
 from load_config import load_config
+import sys
 
-args = load_config()
+config_path = sys.argv[1] if len(sys.argv) >= 2 else None
+args = load_config(config_path=config_path)
+cim_utils.initialize_params(config_path)
 
 torch.autograd.set_detect_anomaly(True)
 logger = logger.Logger(args.log_dir)
@@ -23,9 +26,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
 FLOAT_CKPT_PATH = "./" + "_".join([args.net_name, "float"]) + ".pth"
-NONFUSED_QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "quant", args.clamping_range_mode, "nonfused_bn"]) + ".pth"
-QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "quant", args.clamping_range_mode, "fused_bn" if args.fuse_bn else "nonfused_bn"]) + ".pth"
-ADC_QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "adc_quant", args.clamping_range_mode, "fused_bn" if args.fuse_bn else "nonfused_bn", args.cim_signed_type]) + ".pth"
+NONFUSED_QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "quant", args.clamping_range_mode, args.cim_signed_type, "nonfused_bn"]) + ".pth"
+QUANT_CKPT_PATH = "./" + "_".join([args.net_name, "quant", args.clamping_range_mode, args.cim_signed_type, "fused_bn" if args.fuse_bn else "nonfused_bn"]) + ".pth"
 CKPT_PATH = FLOAT_CKPT_PATH
 
 transform_train = transforms.Compose([
@@ -191,23 +193,26 @@ if os.path.exists(QUANT_CKPT_PATH):
     logger.log("LOADING PRETRAINED QUANTIZED NETWORK")
     net.load_state_dict(torch.load(QUANT_CKPT_PATH), strict=False)
 
-# Fuse batchnorm
-if args.fuse_bn:
-    if not os.path.exists(NONFUSED_QUANT_CKPT_PATH):
-        raise Exception
-    net.load_state_dict(torch.load(NONFUSED_QUANT_CKPT_PATH), strict=False)
+    if args.fuse_bn:
+        print("DEACTIVATING BATCHNORM")
+        for p in net.modules():
+            if isinstance(p, cim_utils.ADC_Conv2d):
+                p.bn.deactivated = True
+else:
+    # Fuse batchnorm
+    logger.log("FUSING BATCHNORM")
+    if args.fuse_bn:
+        if not os.path.exists(NONFUSED_QUANT_CKPT_PATH):
+            raise Exception
+        net.load_state_dict(torch.load(NONFUSED_QUANT_CKPT_PATH), strict=False)
+        #print("Stage 1", test(0))
+        for p in net.modules():
+            if isinstance(p, cim_utils.ADC_Conv2d):
+                p.fuse_batchnorm()
+        #print("Stage 2", test(0))
 
-    print("Stage 1", test(0))
-
-    for p in net.modules():
-        if isinstance(p, cim_utils.ADC_Conv2d):
-            p.fuse_batchnorm()
-
-    print("Stage 2", test(0))
-
-# Train quantized network
-CKPT_PATH = QUANT_CKPT_PATH
-if not os.path.exists(QUANT_CKPT_PATH):
+    # Train quantized network
+    CKPT_PATH = QUANT_CKPT_PATH
     cim_utils.conv_mode = "adc_quantize"
     cim_utils.clamping = False
     logger.log("TRAINING QUANTIZED NETWORK")

@@ -6,7 +6,7 @@ class Dict2Class(object):
         for key in my_dict: 
             setattr(self, key, my_dict[key])
 
-def load_config():
-    with open("config.yaml") as stream:
+def load_config(config_path="config.yaml"):
+    with open(config_path) as stream:
         args = Dict2Class(yaml.safe_load(stream))
     return args
